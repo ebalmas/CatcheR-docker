@@ -1,0 +1,7 @@
+{
+  "collect_image": 0,
+  "check_image": 1,
+  "rstudio_integration": 0,
+  "docker_checks_and_testthat_passed": true,
+  "legacy_syntax_issue_reported": true
+}

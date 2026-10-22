@@ -1,0 +1,163 @@
+---
+title: "CATCHER — comparing libraries within one run"
+subtitle: "the pooled BC libraries, and the sequencing sublibraries"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    df_print: kable
+params:
+  script:       "catcheR_library_comparison.R"
+  run_object:   "analysis_EB_PARSE/Output/parsecatch_AB019c.rds"
+  called_cells: "analysis_EB_PARSE/scratch/cell_metadata.csv.gz"
+  output:       "comparison_out"
+  tag:          "parse_AB019c"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, fig.align = "center")
+library(knitr)
+source(params$script)
+OUT <- params$output
+dir.create(OUT, showWarnings = FALSE, recursive = TRUE)
+show <- function(f) {
+  p <- file.path(OUT, f)
+  if (file.exists(p)) knitr::include_graphics(p) else invisible(NULL)
+}
+```
+
+# What this document does
+
+Two comparisons *inside* one catcheR run. They answer different questions and
+should not be confused:
+
+| | compares | answers |
+|---|---|---|
+| `compare_bc_libraries()` | the pooled **BC libraries** (`set1`, `set2` …), i.e. the barcode-to-gene CSVs | did each library come back, evenly, and with how many cells per construct |
+| `compare_sublibraries()` | the sequencing **sublibraries** (`s1`, `s2` …), i.e. separate FASTQ pairs of the same cell pool | did the aliquots behave alike |
+
+This is **not part of the catcheR package**: it is a standalone script plus
+this document, so it can be adapted per experiment without touching the
+package. It reads the `.rds` the entry point already wrote — nothing is
+re-streamed and it knits in seconds. Run the chemistry's own template first.
+
+To point it at another run, change the parameters in the header:
+
+```r
+rmarkdown::render("catcheR_library_comparison.Rmd", params = list(
+  run_object   = "analysis_EB_PIP/Output/pipcatch_AB019b.rds",
+  called_cells = "analysis_EB_PIP/scratch/AB019b_gex.scRNA.filtered.barcodes.tsv.gz",
+  tag          = "pipseq_AB019b"))
+```
+
+```{r load}
+stopifnot(file.exists(params$run_object))
+res <- readRDS(params$run_object)
+cal <- if (nzchar(params$called_cells) && file.exists(params$called_cells))
+         params$called_cells else NULL
+kable(data.frame(
+  object        = basename(params$run_object),
+  chemistry     = class(res)[1],
+  BC_libraries  = length(unique(res$reference_table$set)),
+  sublibraries  = nrow(res$per_sublibrary),
+  called_cells  = if (is.null(cal)) "not supplied" else basename(cal)))
+```
+
+The called-cell list matters as much here as anywhere: without it the counts
+include the ambient floor, which is not evidence about either library.
+
+# The pooled BC libraries
+
+Each library is scored against **its own size**, taken from the run's reference
+table, so a 60-construct library is never scored out of 100.
+
+```{r libraries}
+L <- compare_bc_libraries(res, called = cal, output_dir = OUT,
+                          file = paste0(params$tag, "_bc_libraries"), verbose = FALSE)
+kable(L[, c("library", "constructs_expected", "constructs_detected", "dropout",
+            "pct_detected", "cells", "cells_per_construct", "clones")],
+      caption = "Recovery and yield per BC library")
+kable(L[, c("library", "cv_cells", "top_decile_share", "gini_cells", "median_cells")],
+      caption = "Evenness within each library")
+```
+
+```{r lib-fig, fig.cap="The pooled BC libraries, compared"}
+show(paste0(params$tag, "_bc_libraries.png"))
+```
+
+Three things to read, in order:
+
+1. **Dropout** (panel A) — constructs in the reference that were never the
+   dominant call in any cell. A library with systematically more dropout than
+   its partner was under-represented in the pool or lost in cloning, and that
+   is worth knowing before any biology is interpreted.
+2. **Evenness** (panel B) — a library can detect every construct and still be
+   unusable if a tenth of them hold most of the cells. The ranked curve shows
+   the skew; CV, top-decile share and Gini quantify it.
+3. **Yield per construct** (panel C) — the fair comparison between pools of
+   different size.
+
+```{r cross}
+kable(data.frame(cells_with_calls_from_more_than_one_library = attr(L, "cross_set_cells")),
+      caption = "Candidate doublets")
+```
+
+Cells carrying calls from more than one library are counted once, under the
+library of their dominant clone, and reported separately: they are candidate
+doublets, not evidence about either library.
+
+One trap the script handles and a quick hand-rolled table usually does not: the
+control constructs — `SCR1`, `SCR2`, `LUCIFERASE`, `B2M`, `ARHGDIA` — carry the
+**same shRNA name in both libraries** (10 of the 160 names on this reference).
+Keying on the name alone credits one detection to both and inflates every
+per-library count, so the script keys on `(shRNA, set)` and uses the library
+the cell's dominant call actually came from.
+
+```{r per-construct}
+pc <- attr(L, "per_construct")
+kable(head(pc[order(pc$set, -pc$cells), ], 10),
+      caption = "Per construct, ranked (full table in the CSV; dropouts are rows of zero)")
+```
+
+# The sequencing sublibraries
+
+```{r sublibraries}
+S <- try(compare_sublibraries(res, called = cal, output_dir = OUT,
+                              file = paste0(params$tag, "_sublibraries"), verbose = FALSE),
+         silent = TRUE)
+if (inherits(S, "try-error")) {
+  cat("Skipped:", conditionMessage(attr(S, "condition")))
+} else {
+  kable(S[, c("sublibrary", "read_pairs", "pct_cassette", "cells", "pct_one_clone",
+              "median_depth", "constructs", "clones", "pct_clones_shared")],
+        caption = "Per sequencing aliquot")
+}
+```
+
+```{r sub-fig, fig.cap="The sequencing sublibraries, compared"}
+show(paste0(params$tag, "_sublibraries.png"))
+```
+
+Aliquots of one cell pool are **expected** to share clones — a clone is a
+population of cells, and its members distribute across aliquots — so a high
+`pct_clones_shared` is normal and is reported rather than flagged. The reading
+that would deserve attention is the opposite: near-zero sharing between
+aliquots that should contain the same cells.
+
+Panel B is the one most likely to show a real asymmetry, since it reflects how
+hard each aliquot was sequenced rather than anything about the biology.
+
+A run with a single FASTQ pair has nothing to compare on this axis, and the
+chunk above says so instead of drawing a one-bar chart.
+
+# Files written
+
+```{r manifest}
+f <- grep(params$tag, list.files(OUT), value = TRUE)
+kable(data.frame(file = f, size_KB = round(file.size(file.path(OUT, f)) / 1024, 1)))
+```
+
+```{r session}
+sessionInfo()
+```

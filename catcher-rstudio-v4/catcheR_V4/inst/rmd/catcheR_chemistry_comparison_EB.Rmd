@@ -1,0 +1,138 @@
+---
+title: "CATCHER across chemistries"
+subtitle: "10x, PIPseq and Parse on the same shRNA library"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    df_print: kable
+params:
+  output:        "comparison_Output"
+  tenx_dir:      "analysis_EB_10X"
+  pip_dir:       "analysis_EB_PIP"
+  parse_dir:     "analysis_EB_PARSE"
+  tenx_sample:   "AB019a"
+  pip_sample:    "AB019b"
+  parse_sample:  "AB019c"
+  tenx_called:   "tenx_called_barcodes.txt"
+  pip_called:    "AB019b_gex.scRNA.filtered.barcodes.tsv.gz"
+  parse_called:  "cell_metadata.csv.gz"
+  labels:        ["10x", "PIPseq", "Parse"]
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, fig.align = "center")
+library(catcheR); library(knitr)
+OUT <- params$output
+dir.create(OUT, showWarnings = FALSE, recursive = TRUE)
+show <- function(f) {
+  p <- file.path(OUT, f)
+  if (file.exists(p)) knitr::include_graphics(p) else invisible(NULL)
+}
+```
+
+# What this document does
+
+It puts one 10x, one PIPseq and one Parse run side by side. It does **not**
+re-read any FASTQ: every number comes from the objects the three entry points
+already wrote, so the whole document knits in seconds.
+
+Run the three pipelines first — each writes `<chemistry>catch_<sample>.rds`
+into its own `Output/<chemistry>/`:
+
+```r
+rmarkdown::render(system.file("rmd", "catcheR_tenxcatch_analysis_EB.Rmd", package = "catcheR"),
+                  params = list(analysis_dir = "analysis_EB_10X",   sample_name = "AB019a"))
+rmarkdown::render(system.file("rmd", "catcheR_pipcatch_analysis_EB.Rmd", package = "catcheR"),
+                  params = list(analysis_dir = "analysis_EB_PIP",   sample_name = "AB019b"))
+rmarkdown::render(system.file("rmd", "catcheR_parsecatch_analysis_EB.Rmd", package = "catcheR"),
+                  params = list(analysis_dir = "analysis_EB_PARSE", sample_name = "AB019c"))
+```
+
+Then knit this one. Add or drop a chemistry by editing the lists in the chunk
+below — nothing else assumes there are exactly three.
+
+# Inputs
+
+```{r inputs}
+# Each entry point writes into Output/<chemistry>/ (its `subdir` default), so
+# the three pipelines cannot overwrite each other. Older runs used a flat
+# Output/, so fall back to that when the nested file is absent.
+find_rds <- function(dir, chem, sample) {
+  f <- file.path(dir, "Output", chem, sprintf("%s_%s.rds", chem, sample))
+  if (file.exists(f)) return(f)
+  file.path(dir, "Output", sprintf("%s_%s.rds", chem, sample))
+}
+rds <- c(find_rds(params$tenx_dir,  "tenxcatch",  params$tenx_sample),
+         find_rds(params$pip_dir,   "pipcatch",   params$pip_sample),
+         find_rds(params$parse_dir, "parsecatch", params$parse_sample))
+cal <- c(
+  file.path(params$tenx_dir,  "scratch", params$tenx_called),
+  file.path(params$pip_dir,   "scratch", params$pip_called),
+  file.path(params$parse_dir, "scratch", params$parse_called))
+names(rds) <- names(cal) <- unlist(params$labels)
+
+inv <- data.frame(
+  chemistry = names(rds),
+  run_object = basename(rds), object_found = file.exists(rds),
+  called_cells = basename(cal), called_found = file.exists(cal))
+stopifnot(all(inv$object_found))
+kable(inv, caption = "Run objects and called-cell lists")
+```
+
+The called-cell lists are what make the comparison fair. Each chemistry's own
+preprocessing (Cell Ranger, PIPseeker, split-pipe) decides which barcodes are
+cells; counting against the barcodes catcheR merely *observed* would include
+the ambient floor and inflate coverage — on the Parse library by more than
+tenfold.
+
+# The comparison
+
+```{r compare}
+C <- catcheR_compare_chemistries(as.list(rds), called = cal,
+                                 output_dir = OUT, verbose = FALSE)
+kable(C[, c("chemistry", "pipeline", "read_pairs", "pct_cellbc", "pct_assigned",
+            "called_cells", "called_one_clone", "pct_called_one_clone",
+            "median_depth_called", "constructs", "clones")],
+      caption = "One row per chemistry; percentages are of that library's own read pairs")
+```
+
+```{r fig, fig.cap="Barcode yield across chemistries"}
+show("chemistry_comparison.png")
+```
+
+# How to read it
+
+**Panel A — where the reads go.** Each stage is a strict subset of the one
+above, and the axis is logarithmic because the libraries can differ by three
+orders of magnitude in the share of reads that reach a barcode. A library that
+collapses at *cell barcode parsed* has an amplicon problem upstream of
+anything catcheR does: a primer-dimer product carries no capture oligo, so its
+read 2 (10x, PIPseq) or read 1 (Parse) is adapter read-through rather than a
+barcode.
+
+**Panel B — the only denominator that compares.** Cells the platform called,
+split into those resolving to exactly one clone and everything else. This is
+the number to put in a methods section.
+
+**Panel C — depth, with a caveat.** A chemistry whose molecular index is long
+enough to deduplicate reports *molecules*; one whose index is too short reports
+*reads*. The `umi_dedup` column says which, and the panel subtitle names the
+read-counted runs. Do not quote the two as one number.
+
+```{r dedup}
+kable(C[, c("chemistry", "umi_dedup", "events", "median_depth_called")],
+      caption = "umi_dedup = FALSE means `events` are reads, not molecules")
+```
+
+# Files written
+
+```{r manifest}
+f <- list.files(OUT)
+kable(data.frame(file = f, size_KB = round(file.size(file.path(OUT, f)) / 1024, 1)))
+```
+
+```{r session}
+sessionInfo()
+```

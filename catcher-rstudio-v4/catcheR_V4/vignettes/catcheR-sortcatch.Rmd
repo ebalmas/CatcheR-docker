@@ -1,0 +1,81 @@
+---
+title: "catcheR sortcatch workflow"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{catcheR sortcatch workflow}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(collapse = TRUE, comment = "#>", eval = FALSE)
+```
+
+# Purpose
+
+`catcheR_sortcatch()` performs barcode-swap correction on the final silencing matrix. It uses the swap table generated during plasmid/intermediate QC and the barcode reference file to correct assigned clone identities.
+
+# Required input files
+
+The input folder should contain:
+
+```text
+scratch/10X/
+  silencing_matrix_complete_1.rds
+  reliable_clones_swaps_DIs100_ratio10.csv
+  rc_barcodes_genes.csv
+```
+
+The swap file is usually produced by `catcheR_step1QC()` and copied from its `to_scratch/` folder.
+
+# Run sortcatch
+
+```{r run-sortcatch}
+library(catcheR)
+
+sorted <- catcheR_sortcatch(
+  folder      = "scratch/10X/",
+  matrix      = "silencing_matrix_complete_1.rds",
+  swaps       = "reliable_clones_swaps_DIs100_ratio10.csv",
+  output_dir  = "Output/",
+  sample_name = "AB017"
+)
+```
+
+# Outputs
+
+```text
+Output/sortcatch/YYMMDD_sortcatch_AB017/
+  csv/
+    silencing_matrix_updated.csv
+  R_objects/
+    sortcatch_result.rds
+    corrected_matrix.rds
+  to_scratch/
+    silencing_matrix_updated.csv
+```
+
+# Use the corrected matrix in R
+
+```{r inspect-sortcatch}
+names(sorted)
+corrected_matrix <- sorted$corrected_matrix
+
+dim(corrected_matrix)
+head(colnames(corrected_matrix))
+```
+
+# Reload a previous run
+
+```{r reload-sortcatch}
+sorted <- readRDS("Output/sortcatch/YYMMDD_sortcatch_AB017/R_objects/sortcatch_result.rds")
+corrected_matrix <- sorted$corrected_matrix
+```
+
+# Continue downstream
+
+The corrected matrix in `to_scratch/` can be used as input for downstream single-cell analyses or copied into your project `scratch/` folder:
+
+```bash
+cp Output/sortcatch/YYMMDD_sortcatch_AB017/to_scratch/silencing_matrix_updated.csv scratch/downstream/
+```

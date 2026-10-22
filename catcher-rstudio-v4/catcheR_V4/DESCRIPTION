@@ -1,0 +1,49 @@
+Package: catcheR
+Type: Package
+Title: Plasmid Library Sequencing Analysis for shRNA CATCHER Experiments
+Version: 0.4.0
+Date: 2026-05-18
+Authors@R: person("Elisa", "Balmas",
+    email = "elisa.balmas@unito.it",
+    role  = c("aut", "cre"))
+Description: End-to-end quality control and analysis of shRNA plasmid library
+    sequencing data produced by the CATCHER / iPS2-seq protocol (HEDGe lab,
+    UNITO). Provides R wrappers for plasmid library QC (step1QC, step2QC),
+    10X single-cell barcode assignment (10Xcatch, 10XcatchQC), cell filtering
+    (filtercatch), empty cell identification (nocatch), barcode swap
+    correction (sortcatch), a native R 10x entry point (tenxcatch,
+    tenx_filtercatch, tenx_nocatch, tenx_seurat), the Fluent PIPseq port
+    (pipcatch, pip_filtercatch, pip_nocatch, pip_seurat), the Parse Evercode
+    port (parsecatch, parse_filtercatch, parse_nocatch, parse_seurat),
+    chemistry-independent threshold diagnostics (call_accuracy,
+    threshold_sweep) and a cross-chemistry comparison
+    (compare_chemistries). All functions run natively without Docker.
+License: MIT + file LICENSE
+Encoding: UTF-8
+LazyData: true
+Roxygen: list(markdown = TRUE)
+RoxygenNote: 7.3.1
+Depends:
+    R (>= 4.0.0)
+Imports:
+    ggplot2  (>= 3.4.0),
+    dplyr    (>= 1.1.0),
+    tidyr    (>= 1.3.0),
+    scales   (>= 1.2.0),
+    forcats  (>= 1.0.0),
+    quantmod (>= 0.4.0),
+    readxl   (>= 1.4.0),
+    patchwork (>= 1.1.0),
+    grDevices
+Suggests:
+    Seurat (>= 5.0.0),
+    hdf5r,
+    Matrix,
+    data.table,
+    devtools,
+    testthat (>= 3.0.0),
+    knitr,
+    rmarkdown
+VignetteBuilder: knitr
+URL: https://github.com/ebalmas/catcheR
+BugReports: https://github.com/ebalmas/catcheR/issues

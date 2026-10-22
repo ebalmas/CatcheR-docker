@@ -1,0 +1,160 @@
+---
+title: "CATCHER workflow: from FASTQ to QC report"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{CATCHER workflow}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(eval = FALSE, echo = TRUE)
+```
+
+## Overview
+
+The `catcheR` package provides an end-to-end R interface for analysing
+shRNA plasmid library sequencing data. The four main functions mirror the
+four steps of the protocol:
+
+| Step | Function | Language |
+|------|----------|----------|
+| 1. Extract UMI/BC/UCI from FASTQ | `catcheR_step2QC_extraction()` | Calls Python |
+| 2. Single-library QC | `catcheR_step2QC_plasmidQC()` | R |
+| 3. Two-library comparison | `catcheR_step2QC_combinedQC()` | R |
+| 4. Publication plots | `catcheR_step2QC_plots()` | R |
+
+## Installation
+
+```{r install}
+# Install dependencies
+install.packages(c("ggplot2", "dplyr", "tidyr", "scales",
+                   "forcats", "patchwork", "data.table"))
+
+# Install catcheR from a local folder
+devtools::install("path/to/catcheR")
+
+# Or from GitHub (once published)
+# devtools::install_github("your-lab/catcheR")
+```
+
+## Step 1 — Extract clones from FASTQ
+
+```{r step1}
+library(catcheR)
+
+catcheR_step2QC_extraction(
+  fastq      = "EB003CS1_KS7_1_finalQC_S1_L001_R1_001.fastq",
+  barcodes   = "rc_barcodes_genes.csv",
+  output_dir = "CATCHER1_new/results/",
+  DIs        = 300
+)
+```
+
+`catcheR_step2QC_extraction()` calls the bundled Python script
+`plasmid_final_corrected.py`, which extracts the barcode (pos 34–41)
+and UCI (pos 42–47) from every read, matches barcodes against the
+reference CSV, and writes `distribution_all_clones.csv` plus supporting
+files to `output_dir`.
+
+## Step 2 — Single-library QC
+
+```{r step2}
+qc <- catcheR_step2QC_plasmidQC(
+  results_dir      = "CATCHER1_new/results/",
+  DIs              = 300,
+  transfect_clones = 100,       # clones from your test nucleofection
+  transfect_cells  = 2000000,   # cells used in that test
+  nucleofect_cells = 2000000    # cells planned for actual experiment
+)
+```
+
+### Key outputs
+
+- `DIs_threshold_stats_DIs300.txt` — read-count breakdown
+- `clone_frequency_dist_DIs300.pdf` — log histogram separating noise from
+  real clones
+- `shrna_representation_3panel_DIs300.pdf` — UCI count distribution across
+  shRNAs
+- `calc_cells_and_dup_DIs300.pdf` — **central decision plot**: for each
+  target m (distinct UCIs per shRNA), how many cells must you nucleofect
+  and what is the expected duplication rate?
+- `UCI_birthday_analysis_DIs300.txt` — full birthday-problem report
+
+### Inspect results programmatically
+
+```{r inspect}
+# Per-shRNA data frame
+head(qc$shrna)
+
+# Birthday results table
+qc$birthday$results
+
+# Expected K at planned nucleofection
+qc$birthday$K_planned
+```
+
+## Step 3 — Combined two-library QC
+
+```{r step3}
+combined <- catcheR_step2QC_combinedQC(
+combined <-  catcheR_step2QC_combinedQC(
+  lib1_dir         = "CATCHER1_new/results/",
+  lib2_dir         = "CATCHER2_new/results/",
+  out_dir          = "combined_results/",
+  lib1_name        = "CATCHER1",
+  lib2_name        = "CATCHER2",
+  DIs              = 300,
+  transfect_clones = 100,
+  transfect_cells  = 2000000,
+  nucleofect_cells = 2000000
+)
+
+# Check the recommendation
+combined$overall_go   # TRUE = GO, FALSE = NO-GO
+```
+
+The go/no-go decision is based on two criteria:
+
+1. **Reproducibility**: Spearman rho of UCI counts >= 0.80
+2. **shRNA overlap**: >= 80% of shRNAs present in both libraries
+
+## Step 4 — Publication plots
+
+```{r step4}
+catcheR_step2QC_plots(
+  results_dir = "CATCHER1_new/results/",
+  DIs         = 300
+)
+```
+
+Produces pie charts, bar charts, and density plots of clone and shRNA
+representation from the Python pipeline outputs.
+
+## Understanding the birthday problem
+
+The key calculation in `catcheR_step2QC_plasmidQC()` and `catcheR_step2QC_combinedQC()` is:
+
+> If a shRNA has **n** distinct UCIs in the library and you recover **K**
+> clones for that shRNA, some clones will share a UCI (duplicates).
+> 
+> E[distinct] = n × (1 − (1 − 1/n)^K)
+> 
+> % duplicates = (K − E[distinct]) / K × 100
+
+**K is not chosen by you.** It follows from how many cells you nucleofect:
+
+```
+K = (cells_nucleofected × efficiency) / n_shRNAs
+```
+
+The `calc_cells_and_dup` plot shows, for each target **m** (distinct
+UCIs you want per shRNA), how many cells you need and what % will be
+duplicates. For CATCHER2 (mean n = 8.91):
+
+| m | Cells needed | % dup | Verdict |
+|---|---|---|---|
+| 2 | 4M | 5.6% | OK |
+| 3 | 5.9M | 10.8% | OK |
+| 4 | 7.9M | 15.6% | OK |
+| 5 | 9.9M | 20.1% | Borderline |

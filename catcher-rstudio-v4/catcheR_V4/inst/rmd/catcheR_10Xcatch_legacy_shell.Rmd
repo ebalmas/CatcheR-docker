@@ -1,0 +1,129 @@
+---
+title: "CATCHER on 10X Genomics"
+subtitle: "`catcheR_10Xcatch` (legacy shell-driven path)"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    df_print: kable
+params:
+  analysis_dir:  "analysis_EB"
+  scratch:       "scratch"
+  output:        "Output"
+  sample_name:   "1"
+  fastq_r1:      "sample_S1_L001_R1_001.fastq.gz"
+  fastq_r2:      "sample_S1_L001_R2_001.fastq.gz"
+  expression_matrix: "filtered_feature_bc_matrix"
+  reference:     "GGCGCGTTCATCTGGGGGAGCCG"
+  uci_length:    6
+  percentage:    15
+  ratio:         5
+  mode:          "bimodal"
+  samples:       1
+  threads:       2
+  zoom_x:        100
+  zoom_y:        400
+---
+
+> **Legacy document.** This template drives `catcheR_10Xcatch()`, the original
+> entry point that runs the bundled shell scripts through `system()` and writes
+> its intermediates into the input folder. It is kept for reference and has
+> **not** been executed on a real dataset. For new 10x analyses use
+> `catcheR_tenxcatch_analysis_EB.Rmd`, which runs natively in R and writes only
+> into `Output/`, and has been knitted end to end on AB019a with the 0.4.0
+> code (15.3 min, 60 files). See `docs/pipeline-10x.md`.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, fig.align = "center")
+library(catcheR); library(knitr)
+SCRATCH <- file.path(params$analysis_dir, params$scratch)
+OUT     <- file.path(params$analysis_dir, params$output)
+dir.create(OUT, showWarnings = FALSE, recursive = TRUE)
+show <- function(f, ext = "jpg") {
+  p <- file.path(SCRATCH, paste0(f, ".", ext))
+  if (file.exists(p)) knitr::include_graphics(p) else invisible(NULL)
+}
+```
+
+# How this path differs from the other two
+
+`catcheR_10Xcatch()` is the original CATCHER pipeline. Unlike
+[catcheR_pipcatch()] and [catcheR_parsecatch()], which are pure R, it drives
+bundled shell and R scripts, so it needs a working `bash` and writes its
+intermediates **into the input folder** rather than into `Output/`. The folder
+convention below therefore puts `scratch/` where the pipeline expects to work.
+
+Three further differences worth knowing before you compare results across
+chemistries:
+
+| | 10X | PIPseq | Parse |
+|---|---|---|---|
+| cassette read | read 2 | read 2 | **read 1** |
+| cell barcode | read 1, fixed 16 nt slice | read 1, 4 tiers with phasing | read 2, 3 ligation rounds |
+| molecular index | 12 nt UMI | 3 nt, not deduplicable | 10 nt UMI |
+| default `ratio` | 5 | 2 | 2 |
+
+# Inputs
+
+`catcheR_10Xcatch()` requires `rc_barcodes_genes.csv` under exactly that name
+in the same folder; it is not a parameter.
+
+```{r inputs}
+need <- c(params$fastq_r1, params$fastq_r2, "rc_barcodes_genes.csv")
+inv <- data.frame(file = need, exists = file.exists(file.path(SCRATCH, need)))
+inv <- rbind(inv, data.frame(file = params$expression_matrix,
+                             exists = file.exists(file.path(SCRATCH, params$expression_matrix))))
+stopifnot(all(inv$exists))
+kable(inv, caption = sprintf("Inputs found in %s", SCRATCH))
+```
+
+# Extraction and QC
+
+```{r tenx, cache=TRUE}
+catcheR_10Xcatch(folder            = SCRATCH,
+                 fastq.read1       = params$fastq_r1,
+                 fastq.read2       = params$fastq_r2,
+                 expression.matrix = params$expression_matrix,
+                 reference         = params$reference,
+                 UCI.length        = params$uci_length,
+                 threads           = params$threads,
+                 percentage        = params$percentage,
+                 mode              = params$mode,
+                 ratio             = params$ratio,
+                 samples           = params$samples,
+                 x                 = params$zoom_x,
+                 y                 = params$zoom_y)
+```
+
+# Cell filtering and unperturbed cells
+
+```{r downstream, cache=TRUE}
+catcheR_filtercatch(folder = SCRATCH, percentage = params$percentage,
+                    ratio = params$ratio, samples = params$samples)
+catcheR_nocatch(folder = SCRATCH, samples = params$samples)
+```
+
+# The thirteen plots
+
+```{r plots, fig.show="hold", out.width="48%"}
+for (f in c("barcode_distribution", "gene_distribution", "UMIxUCI", "UCIxcell",
+            "percentage_of_UMIxUCI_dist", "2D_percentage_of_UMIxUCI_UMI_count",
+            "2D_percentage_of_UMIxUCI_UMI_count_thresholds", "true_UCIxcell",
+            "2D_percentage_of_UMIxUCI_UMI_count_trueorfalse", "cellsxclone",
+            "cellsxclone_log10", "2D_percentage_of_UMIxUCI_UMI_count_ValidCells")) show(f)
+show(sprintf("UMIxUCI_%s_%s", params$zoom_x, params$zoom_y))
+```
+
+# Files written
+
+```{r manifest}
+f <- list.files(SCRATCH, pattern = "\\.(csv|jpg|pdf|txt)$")
+kable(data.frame(file = f,
+                 size_KB = round(file.size(file.path(SCRATCH, f)) / 1024, 1)),
+      caption = sprintf("Outputs in %s", SCRATCH))
+```
+
+```{r session}
+sessionInfo()
+```

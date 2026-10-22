@@ -1,0 +1,23 @@
+{
+  "Id": "sha256:77e7f3f01227d3d738ef4e1cbbc140a221a5cf268ebebe24282a36d2dde68db6",
+  "Created": "2026-10-20T23:27:49.961486881Z",
+  "Architecture": "amd64",
+  "Os": "linux",
+  "Size": 5119172836,
+  "RepoTags": [
+    "hedgelab/catcher-rstudio:v4-724ef89"
+  ],
+  "labels": {
+    "org.opencontainers.image.authors": "Carl Boettiger <cboettig@ropensci.org>",
+    "org.opencontainers.image.base.name": "docker.io/library/ubuntu:noble",
+    "org.opencontainers.image.description": "RStudio, full analysis R library collection, Python and Bash",
+    "org.opencontainers.image.licenses": "GPL-2.0-or-later",
+    "org.opencontainers.image.ref.name": "ubuntu",
+    "org.opencontainers.image.revision": "724ef8900a6edb31136a7b0ccf4d3d5e3ba18dbe",
+    "org.opencontainers.image.source": "https://github.com/ebalmas/catcheR",
+    "org.opencontainers.image.title": "catcheR V4 RStudio",
+    "org.opencontainers.image.vendor": "Rocker Project",
+    "org.opencontainers.image.version": "R-4.5.2"
+  },
+  "collected_utc": "2026-10-20T23:28:05Z"
+}

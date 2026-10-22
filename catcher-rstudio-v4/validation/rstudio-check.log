@@ -1,0 +1,17 @@
+RStudio: http://localhost:18081
+Utente: rstudio
+Esperimento: /Users/elisabalmaselisabalmas/Documents/Codex/2026-10-20/continua-lo-sviluppo-di-catcher-v4/work/EB_analysis docker check
+Per fermare: docker stop catcher-rstudio-v4-check
+
+RStudio user: catcheR and Seurat load; docs and vignettes accessible; shared folder writable.
+
+{
+  "rstudio_sign_in_http_status": 200,
+  "rstudio_user_R_and_source_access": true,
+  "host_sees_container_output": true,
+  "single_bind_mount": true,
+  "shared_folder_path_with_spaces": true,
+  "output_persists_after_stop": true,
+  "image": "hedgelab/catcher-rstudio:v4-724ef89",
+  "completed_utc": "2026-10-20T23:28:21Z"
+}

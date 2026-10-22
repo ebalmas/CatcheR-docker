@@ -1,0 +1,159 @@
+---
+title: "catcheR_parsecatch: CATCHER barcode assignment for Parse Evercode"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{catcheR_parsecatch: CATCHER barcode assignment for Parse Evercode}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r, include = FALSE}
+knitr::opts_chunk$set(collapse = TRUE, comment = "#>", eval = FALSE)
+```
+
+## Why a separate entry point
+
+The CATCHER cassette is unchanged, but Parse puts it in a different place and
+builds the cell barcode differently, so neither `catcheR_10Xcatch()` nor
+`catcheR_pipcatch()` can read these libraries.
+
+|  | 10X | PIPseq | Parse |
+|---|---|---|---|
+| cassette on | read 2 | read 2 | **read 1**, reverse complement |
+| cell barcode on | read 1, fixed 16 nt slice | read 1, four tiers with phasing | read 2, three ligation rounds |
+| needs a whitelist | no | no | **yes** |
+| molecular index | 12 nt UMI | 3 nt, not deduplicable | 10 nt UMI |
+
+The real UMI is the most consequential difference. On PIPseq every metric is a
+read count; on Parse `UMIxUCI` is a genuine molecule count, which is why the
+Parse defaults can afford `UMI.count = 1` and a per-cell floor.
+
+## Read layout
+
+Read 1, after one leading base:
+
+```
+[1 nt] rc(reference 23) rc(UCI 6) rc(barcode 8) ACGCGTAGCTCGCTGATCAG ...
+```
+
+Read 2:
+
+```
+[UMI 10][bc3 8][ATGAGGGGTCAG][bc2 8][TCCAACCACCTC][bc1 8][poly-T]
+```
+
+The rounds run 3-2-1 from the 5' end because round 3 ligates last. Each 8 nt
+slot is drawn from a published whitelist, so a slot that matches nothing is a
+sequencing error rather than a new cell.
+
+The cassette is sliced relative to the **vector constant**, not the reference.
+Roughly 5% of cassette-bearing reads carry an error inside the 15 nt reference
+anchor; anchoring on the constant recovers them with the correct barcode, while
+the reads this also admits carry no valid barcode and are dropped at the
+reference lookup.
+
+## The barcode file is required
+
+`barcode.data` must be split-pipe's own `barcode_data.csv`. Round 1 holds
+**two** sequences per well, one oligo-dT and one random hexamer, both mapping
+to the same well. In a 3' enrichment library the hexamer barcodes are
+several-fold rarer, so a whitelist taken from the most abundant sequences per
+round recovers only the dT set. On a real library, using the inferred
+whitelist corrected 93% of reads; the real file corrected 99%.
+
+The file is not a plain CSV - `#` comment lines separate the rounds and the
+single header sits after the first of them - so `read.csv()` fails on it.
+`catcheR_parsecatch()` reads it for you.
+
+## A complete run
+
+```r
+library(catcheR)
+
+res <- catcheR_parsecatch(
+  folder         = "analysis_EB/scratch",
+  fastq.read1    = c("AB019c_BC_n1_S7_L001_R1_001.fastq.gz",
+                     "AB019c_BC_n2_S8_L001_R1_001.fastq.gz"),
+  fastq.read2    = c("AB019c_BC_n1_S7_L001_R2_001.fastq.gz",
+                     "AB019c_BC_n2_S8_L001_R2_001.fastq.gz"),
+  sublibraries   = c("s1", "s2"),
+  barcode.data   = "barcode_data.csv",
+  barcodes.genes = c("rc_barcodes_genes_set1.csv", "rc_barcodes_genes_set2.csv"),
+  set.names      = c("set1", "set2"),
+  set.sizes      = c(100L, 60L),
+  output_dir     = "analysis_EB/Output",
+  sample_name    = "AB019c")
+res
+#> <parsecatch> sample AB019c | 21,451,610 read pairs over 2 sublibraries | ...
+```
+
+One FASTQ pair per sublibrary. Parse reuses well combinations across
+sublibraries, so the same triplet in two of them is two different cells; the
+sublibrary suffix is part of the cell ID for exactly that reason.
+
+## Filtering, empty cells, and the matrix
+
+```r
+flt <- catcheR_parse_filtercatch(res, UMI.count = 1, percentage = 15,
+                                 ratio = 2, min.cell.UMI = 20)
+noc <- catcheR_parse_nocatch(res, filtered = flt)
+
+obj <- catcheR_parse_seurat(
+  res, filtered = flt, empty = noc,
+  mtx   = "analysis_EB/scratch/count_matrix.mtx.gz",
+  genes = "analysis_EB/scratch/all_genes.csv.gz",
+  cells = "analysis_EB/scratch/cell_metadata.csv.gz",
+  rename = TRUE, subset.valid = TRUE)
+```
+
+`count_matrix.mtx` is stored **cells x genes**, the transpose of the 10X and
+PIPseeker convention, so `Seurat::ReadMtx()` cannot read it;
+`catcheR_parse_seurat()` transposes on load. Cells are keyed by `bc_wells`,
+which is what `catcheR_parsecatch()` emits, so the join is a plain string
+match.
+
+## Choosing the thresholds
+
+Do not choose them by yield. Maximising the number of cells that get a call
+argues for no filter at all; what the filter is for is keeping the calls
+correct.
+
+```r
+acc <- catcheR_call_accuracy(res, min.truth.UMI = 100)
+```
+
+This takes the deep, unambiguous cells as ground truth, subsamples each one to
+a target depth, re-applies the rule, and separates a *wrong* call from *no*
+call. On a real library the share of calls made that were wrong ran 13% at
+5 UMIs per cell, 9% at 10, 1.9% at 20 and 1.1% at 30 - which is what sets the
+floor at 20.
+
+```r
+sw <- catcheR_threshold_sweep(res, percentage = c(10, 12, 15, 18, 20),
+                              UMI.count = c(0, 1), min.cell.UMI = c(0, 20))
+```
+
+The sweep separates the two opposite ways a cell fails: no UCI cleared the cut,
+or more than one did. Lowering `percentage` mostly moves cells from the first
+into the second rather than into a call, which is why 12 is not an improvement
+on 15 despite what the share distribution suggests by eye.
+
+Watch for one arithmetic effect: a cell holding fewer than `100 / percentage`
+UMIs has every single-UMI UCI clearing the percentage cut, so several pass and
+the cell is rejected. At `percentage = 15` that is any cell under about
+7 UMIs, and `UMI.count = 1` removes most of it.
+
+## The honest denominator
+
+The barcodes this pipeline produces include ambient ones that split-pipe never
+called as cells. A detection rate over all observed barcodes overstates
+coverage - sometimes severalfold. Quote the rate over the called-cell list,
+which is what `catcheR_parse_seurat()` reports.
+
+## Template
+
+```r
+rmarkdown::render(
+  system.file("rmd", "catcheR_parsecatch_analysis_EB.Rmd", package = "catcheR"),
+  params = list(analysis_dir = "analysis_EB", sample_name = "AB019c"))
+```

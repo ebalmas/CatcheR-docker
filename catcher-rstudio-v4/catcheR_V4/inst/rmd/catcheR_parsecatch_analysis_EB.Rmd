@@ -1,0 +1,419 @@
+---
+title: "CATCHER on Parse Evercode"
+subtitle: "`catcheR_parsecatch` worked example"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    df_print: kable
+params:
+  analysis_dir:   "analysis_EB"
+  scratch:        "scratch"
+  output:         "Output"
+  to_scratch:     true
+  sample_name:    "AB019c"
+  fastq_r1:       ["AB019c_BC_n1_S7_L001_R1_001.fastq.gz", "AB019c_BC_n2_S8_L001_R1_001.fastq.gz"]
+  fastq_r2:       ["AB019c_BC_n1_S7_L001_R2_001.fastq.gz", "AB019c_BC_n2_S8_L001_R2_001.fastq.gz"]
+  sublibraries:   ["s1", "s2"]
+  barcode_data:   "barcode_data.csv"
+  barcodes_genes: ["rc_barcodes_genes_set1.csv", "rc_barcodes_genes_set2.csv"]
+  set_names:      ["set1", "set2"]
+  set_sizes:      [100, 60]
+  dge_mtx:        "count_matrix.mtx.gz"
+  dge_genes:      "all_genes.csv.gz"
+  dge_cells:      "cell_metadata.csv.gz"
+  percentage:     15
+  ratio:          2
+  umi_count:      1
+  min_cell_umi:   20
+  max_edit_distance: 1
+  jitter:         "auto"
+  max_reads:      ~
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, fig.align = "center")
+library(catcheR); library(ggplot2); library(knitr)
+
+## Folder layout -------------------------------------------------------------
+##   analysis_EB/
+##     scratch/   <- every input listed below
+##     Output/    <- everything this document writes
+SCRATCH <- file.path(params$analysis_dir, params$scratch)
+OUT     <- file.path(params$analysis_dir, params$output)
+dir.create(OUT, showWarnings = FALSE, recursive = TRUE)
+show <- function(f, ext = "jpg") {
+  p <- file.path(OUT, paste0(f, ".", ext))
+  if (file.exists(p)) knitr::include_graphics(p) else invisible(NULL)
+}
+MAXR <- if (is.null(params$max_reads)) Inf else as.numeric(params$max_reads)
+theme_set(theme_minimal(base_size = 9))
+```
+
+# The pipeline, and where this document sits in it
+
+Four steps, in this order. Each one consumes what the previous produced, and
+nothing here re-reads the FASTQ after the first step.
+
+| # | step | reads | produces | needed by |
+|---|---|---|---|---|
+| 1 | `catcheR_parsecatch()` | the two FASTQ pairs, `barcode_data.csv`, the barcode-to-gene CSVs | the `parsecatch` object (`.rds`), `complete_table_fin`, the 13 catcheR plots and the QC panels | every step below |
+| 2 | `catcheR_parse_filtercatch()` | the object from 1 | `ValidCell` at the chosen thresholds, `cells_with_at_least_1_UCI.csv`, `new_cell_names.csv` | steps 3 and 4 |
+| 3 | `catcheR_parse_nocatch()` | the object from 1 **and** the filter from 2 | the empty-vector cells, i.e. the unperturbed control set | step 4 (optional) |
+| 4 | `catcheR_parse_seurat()` | the filter from 2, the empty set from 3, and split-pipe's DGE | the Seurat object with `catcheR_status` on every cell | your downstream analysis |
+
+**Why the order matters.** Step 3 needs step 2 because an "empty" cell is
+defined as one that is *not* in the called set: without the filter there is
+nothing to subtract from. Step 4 needs step 2 for the same reason and step 3
+only if you want the controls labelled rather than left as `not_detected`.
+
+**What can be repeated cheaply.** Steps 2 to 4 all act on the object, so
+re-filtering at new thresholds costs seconds and never re-streams the reads.
+Only step 1 is expensive.
+
+## Where the files go
+
+```
+analysis_EB/
+  scratch/                       <- inputs, plus the handoff copies below
+  Output/
+    parsecatch/                  <- step 1: this chemistry's own folder
+      filtercatch_p15_u1_r2_f20/ <- step 2, tagged with its thresholds
+```
+
+Step 1 nests under the chemistry name so that running the 10x or PIPseq
+pipeline into the same `Output/` cannot overwrite these files - the 13 plots
+carrying catcheR's own names have no chemistry in the filename. Step 2 adds a
+folder named for its thresholds, so a second attempt at different values sits
+beside the first instead of replacing it.
+
+Three files are *inputs to a later step* rather than deliverables:
+`cells_with_at_least_1_UCI.csv`, `new_cell_names.csv` and
+`complete_table_fin_<sample>.csv`. With `to_scratch: true` they are copied into
+`scratch/` as `<name>_parsecatch_<sample>.csv`, so a 10x and a Parse run can
+share one scratch without colliding. The originals stay in `Output/`.
+
+## One trap in the thresholds
+
+`UMI.count` and `percentage` exclude with a strict `>`, `min.cell.UMI` includes
+with `>=`. So `UMI.count = 1` keeps pairs of **two or more** UMIs, a UCI at
+exactly 15% does **not** pass `percentage = 15`, and a cell with exactly 20
+cassette UMIs **does** pass `min.cell.UMI = 20`. The floor keeps
+applying by default: step 2 also defaults it to 20, so it stays in force unless
+you pass another value (`0` disables it). This document passes it explicitly at
+both steps, so the YAML header is the single source of truth.
+
+# What this document needs
+
+Everything lives in `scratch/`. This chunk is a guard: it fails here rather
+than twenty minutes into a stream.
+
+```{r inputs}
+need <- data.frame(
+  file = c(params$fastq_r1, params$fastq_r2, params$barcode_data,
+           params$barcodes_genes, params$dge_mtx, params$dge_genes, params$dge_cells),
+  role = c(rep("read 1 - carries the cassette", length(params$fastq_r1)),
+           rep("read 2 - carries the cell barcode", length(params$fastq_r2)),
+           "split-pipe barcode whitelist",
+           rep("shRNA barcode -> gene", length(params$barcodes_genes)),
+           "split-pipe count matrix (cells x genes)",
+           "split-pipe gene table", "split-pipe called cells"))
+need$exists  <- file.exists(file.path(SCRATCH, need$file))
+need$size_MB <- round(file.size(file.path(SCRATCH, need$file)) / 1024^2, 1)
+stopifnot(all(need$exists))
+kable(need, caption = sprintf("Inputs found in %s", SCRATCH))
+```
+
+`barcode_data.csv` is not optional and cannot be reconstructed from the data.
+Round 1 of the Parse barcode carries **two** sequences per well, one oligo-dT
+and one random hexamer; in a 3' enrichment library the hexamer barcodes are
+several-fold rarer, so a whitelist taken from the most abundant sequences
+recovers only the dT set and silently discards the rest. Copy the file from
+your split-pipe run (it sits beside the DGE output).
+
+# Extraction
+
+One pass per sublibrary. This is the only expensive step, so the chunk is
+cached: re-knitting to adjust a threshold or a plot does not re-read the FASTQ.
+
+```{r parsecatch, cache=TRUE}
+res <- catcheR_parsecatch(
+  folder            = SCRATCH,
+  fastq.read1       = params$fastq_r1,
+  fastq.read2       = params$fastq_r2,
+  sublibraries      = params$sublibraries,
+  barcode.data      = params$barcode_data,
+  barcodes.genes    = params$barcodes_genes,
+  set.names         = params$set_names,
+  set.sizes         = as.integer(params$set_sizes),
+  output_dir        = OUT,
+  sample_name       = params$sample_name,
+  called.cells      = file.path(SCRATCH, params$dge_cells),
+  percentage        = params$percentage,
+  ratio             = params$ratio,
+  UMI.count         = params$umi_count,
+  min.cell.UMI      = params$min_cell_umi,
+  max.edit.distance = params$max_edit_distance,
+  jitter            = params$jitter,
+  max.reads         = MAXR,
+  verbose           = FALSE)
+# The entry point nests its outputs one level down, under the chemistry name,
+# so another pipeline writing into the same Output/ cannot overwrite these.
+# Take the path from the object rather than rebuilding it here.
+OUT <- res$output_dir
+res
+```
+
+## Where the reads went
+
+```{r read-classes}
+kable(res$read_class, caption = "Read fates")
+kable(res$per_sublibrary, caption = "Per sublibrary")
+```
+
+The funnel below is the same information as a figure. Each stage is a strict
+subset of the one above, so the bars are absolute read counts; the percentage
+is of that sublibrary's own read pairs, never renormalised within a stage.
+
+```{r funnel, fig.cap="Read fates per sublibrary and pooled"}
+show("parsecatch_detection_funnel", "png")
+```
+
+## Which barcodes are cells
+
+The knee separates real cells from the ambient floor. Comparing where it falls
+to the cell count split-pipe itself called is the cheapest sanity check on the
+whole extraction: the two are derived from completely different data.
+
+```{r rank, fig.cap="Barcode-rank curve against the called-cell count"}
+show("parsecatch_barcode_rank", "png")
+```
+
+## Would more sequencing help?
+
+Answered by subsampling the reads that support each molecule, not by fitting a
+curve and extrapolating. Read the marginal-return panel rather than the
+rarefaction one: a curve that still rises slowly is not the same as a curve
+worth paying for.
+
+```{r saturation, fig.cap="Exact rarefaction and marginal return"}
+show("parsecatch_saturation", "png")
+```
+
+```{r saturation-table}
+f <- file.path(OUT, "parsecatch_saturation.csv")
+if (file.exists(f)) kable(read.csv(f), caption = "Rarefaction, ten depth fractions")
+```
+
+## Construct geometry as the data confirms it
+
+Read 1 is `[1 nt] rc(reference) rc(UCI) rc(barcode) constant ...`; read 2 is
+`[UMI 10][bc3][linker A][bc2][linker B][bc1][poly-T]`. The cassette slice is
+taken relative to the **vector constant**, not to the reference, which matters:
+about 5% of cassette-bearing reads carry a sequencing error inside the 15 nt
+reference anchor, and anchoring on the constant still recovers them with the
+right barcode.
+
+```{r geometry}
+p <- res$params
+kable(data.frame(
+  field = c("reference", "empty reference", "vector constant", "UCI length",
+            "barcode length", "UMI length", "linker A", "linker B",
+            "barcode correction radius"),
+  value = c(p$reference, p$empty.reference, p$constant, p$UCI.length,
+            p$barcode.length, p$umi.length, p$linker.a, p$linker.b,
+            p$max.edit.distance)))
+```
+
+# Choosing the thresholds
+
+Yield is the wrong criterion here. Maximising the number of cells that receive
+a call argues for no filter at all; what the filter is for is keeping the calls
+*correct*. `catcheR_call_accuracy()` measures that directly: it takes the deep,
+unambiguous cells as ground truth, subsamples each one down to a target depth,
+re-applies the rule, and separates a wrong call from no call.
+
+```{r accuracy, cache=TRUE}
+acc <- catcheR_call_accuracy(res, min.truth.UMI = 100, output_dir = OUT, verbose = FALSE)
+kable(acc, caption = "Wrong calls are far worse than missing ones")
+```
+
+```{r accuracy-fig, fig.width=5.2, fig.height=3.2}
+long <- data.frame(
+  depth   = rep(acc$UMIs_in_cell, 3),
+  outcome = factor(rep(c("correct call", "WRONG call", "no call"), each = nrow(acc)),
+                   levels = c("correct call", "WRONG call", "no call")),
+  pct     = c(acc$correct, acc$wrong, acc$no_call))
+ggplot(long, aes(factor(depth), pct, fill = outcome)) +
+  geom_col(width = .65) +
+  scale_fill_manual(values = c("correct call" = "#2E6E8E", "WRONG call" = "#B4432F",
+                               "no call" = "#C7D3DC")) +
+  labs(x = "cassette UMIs available in the cell", y = "% of reference cells",
+       fill = NULL, title = "Below ~20 UMIs the calls stop being trustworthy")
+```
+
+The sweep separates the two opposite ways a cell fails. Lowering `percentage`
+does not rescue cells that have no dominant UCI; it mostly turns them from
+"no UCI passes" into "more than one passes", which is still not a call.
+
+```{r sweep, cache=TRUE}
+sw <- catcheR_threshold_sweep(res, percentage = c(10, 12, 15, 18, 20),
+                              UMI.count = c(0, 1), min.cell.UMI = c(0, params$min_cell_umi),
+                              output_dir = OUT, verbose = FALSE)
+kable(sw[sw$UMI.count == params$umi_count & sw$min.cell.UMI == params$min_cell_umi, ],
+      row.names = FALSE, caption = "At the chosen UMI.count and cell floor")
+```
+
+## Judged against the cells split-pipe actually called
+
+The panels above count every barcode this package observed, ambient floor
+included. The honest denominator is the cell list split-pipe called: here it is
+fixed per panel, so a percentage axis does not mislead, and the absolute cell
+count is printed above each bar anyway.
+
+```{r called-comp, fig.cap="Clone composition of the called cells"}
+show("parsecatch_called_composition", "png")
+```
+
+```{r called-floor, fig.cap="The UMI-floor panel restricted to called cells"}
+show("parsecatch_UCI_per_cell_called", "png")
+```
+
+## Where to put the per-cell UMI floor
+
+Left axis: how many cells still get a clone call. Right axis: the share of
+those calls expected to be wrong, from the subsampling experiment. Note the
+red curve is not monotonic at the far left - at 2-3 UMIs so few cells get any
+call that the wrong-call share is small for the wrong reason. The decision
+point is where it flattens.
+
+```{r yield-error, fig.cap="Yield against expected error"}
+show("parsecatch_yield_vs_error", "png")
+```
+
+## Clone composition against the per-cell UMI floor
+
+Absolute counts, per sublibrary and pooled, with the total barcodes surviving
+each cutoff printed above the stack. A rising "one clone" *share* means little
+on its own; what matters is how many cells are discarded to achieve it.
+
+```{r uci-per-cell, fig.cap="Clone composition at a ladder of per-cell UMI floors"}
+show("parsecatch_UCI_per_cell", "png")
+```
+
+## What the two filter parameters buy
+
+```{r diag, fig.cap="Call accuracy against depth, and the percentage sweep"}
+show("parsecatch_call_accuracy", "png")
+show("parsecatch_threshold_sweep", "png")
+```
+
+# Cell filtering
+
+```{r filtercatch}
+flt <- catcheR_parse_filtercatch(res,
+  # the files a later step reads are copied into scratch/, renamed with the
+  # chemistry and the sample, so several pipelines can share one scratch
+  to.scratch   = if (isTRUE(params$to_scratch)) SCRATCH else NULL,
+                                 UMI.count    = params$umi_count,
+                                 percentage   = params$percentage,
+                                 ratio        = params$ratio,
+                                 min.cell.UMI = params$min_cell_umi,
+                                 output_dir   = OUT, jitter = params$jitter,
+                                 verbose      = FALSE)
+kable(flt$filter_returns, caption = "ValidCell across candidate UMI.count values")
+```
+
+```{r stage2-plots, fig.show="hold", out.width="48%"}
+show("2D_percentage_of_UMIxUCI_UMI_count_thresholds"); show("true_UCIxcell")
+show("cellsxclone"); show("2D_percentage_of_UMIxUCI_UMI_count_ValidCells")
+```
+
+# Unperturbed cells
+
+```{r nocatch}
+noc <- catcheR_parse_nocatch(res, filtered = flt, threshold = 0,
+                             output_dir = OUT, verbose = TRUE)
+```
+
+# Join to the split-pipe matrix
+
+This is the only denominator worth quoting. The barcodes this pipeline
+produces include ambient ones that split-pipe never called as cells, so a rate
+computed over all observed barcodes overstates coverage.
+
+`count_matrix.mtx` is written **cells x genes**, the transpose of the 10X and
+PIPseeker convention, so it is transposed on load and `Seurat::ReadMtx()`
+cannot be used.
+
+```{r seurat}
+obj <- catcheR_parse_seurat(res, filtered = flt, empty = noc,
+                            mtx    = file.path(SCRATCH, params$dge_mtx),
+                            genes  = file.path(SCRATCH, params$dge_genes),
+                            cells  = file.path(SCRATCH, params$dge_cells),
+                            sample_id = params$sample_name,
+                            project   = params$sample_name,
+                            output_dir = OUT, verbose = TRUE)
+```
+
+## Clone composition of the called cells
+
+Absolute counts, with the number of cells split-pipe called as the reference
+line. Percentages that renormalise inside each threshold bin hide how many
+cells a stricter threshold throws away.
+
+```{r composition, fig.width=8.4, fig.height=3.3}
+meta <- utils::read.csv(file.path(OUT, sprintf("parsecatch_cell_metadata_%s.csv",
+                                               params$sample_name)))
+meta$sublib <- sub("^.*__", "", meta$cellID)
+meta$UMI_total[is.na(meta$UMI_total)] <- 0
+meta$True_UCIxcellID[is.na(meta$True_UCIxcellID)] <- 0
+cls <- function(d) data.frame(
+  category = factor(c("1 clone", "2 clones", ">=3 clones", "no dominant UCI", "no cassette UMI"),
+                    levels = c("1 clone", "2 clones", ">=3 clones",
+                               "no dominant UCI", "no cassette UMI")),
+  cells = c(sum(d$True_UCIxcellID == 1), sum(d$True_UCIxcellID == 2),
+            sum(d$True_UCIxcellID >= 3),
+            sum(d$UMI_total > 0 & d$True_UCIxcellID == 0), sum(d$UMI_total == 0)))
+dd <- do.call(rbind, lapply(c(split(meta, meta$sublib), list(both = meta)), function(d) {
+  z <- cls(d); z$group <- NA; z }))
+dd$group <- rep(c(names(split(meta, meta$sublib)), "both"), each = 5)
+ref <- do.call(rbind, lapply(c(split(meta, meta$sublib), list(both = meta)), function(d)
+  data.frame(cells = nrow(d))))
+ref$group <- c(names(split(meta, meta$sublib)), "both")
+ggplot(dd, aes(group, cells, fill = category)) +
+  geom_col(width = .6) +
+  geom_hline(data = ref, aes(yintercept = cells), linetype = 2, colour = "#B4432F") +
+  scale_fill_manual(values = c("1 clone" = "#2E6E8E", "2 clones" = "#D1A13A",
+                               ">=3 clones" = "#B4432F", "no dominant UCI" = "#C7D3DC",
+                               "no cassette UMI" = "#F0F0F0")) +
+  labs(x = NULL, y = "cells split-pipe called", fill = NULL,
+       title = "Clone calls on the called cells, with the cell total as reference")
+kable(dd, caption = "Counts behind the figure")
+```
+
+# The thirteen catcheR plots
+
+Written to `Output/` as both `.jpg` and `.pdf`, under the same names
+`catcheR_10Xcatch` uses.
+
+```{r plots, fig.show="hold", out.width="48%"}
+for (f in c("barcode_distribution", "gene_distribution", "UMIxUCI", "UCIxcell",
+            "percentage_of_UMIxUCI_dist", "2D_percentage_of_UMIxUCI_UMI_count")) show(f)
+zf <- list.files(OUT, pattern = "^UMIxUCI_[0-9]+_[0-9]+\\.jpg$")
+if (length(zf)) knitr::include_graphics(file.path(OUT, zf[1]))
+```
+
+# Files written
+
+```{r manifest}
+f <- list.files(OUT)
+kable(data.frame(file = f,
+                 size_KB = round(file.size(file.path(OUT, f)) / 1024, 1)),
+      caption = sprintf("Contents of %s", OUT))
+```
+
+```{r session}
+sessionInfo()
+```

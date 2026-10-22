@@ -1,0 +1,339 @@
+---
+title: "Colony PCR Sanger sequencing QC with catcheR_sangerQC()"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{Colony PCR Sanger sequencing QC}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(eval = FALSE, echo = TRUE)
+```
+
+## Where this step fits in the CATCHER workflow
+
+The CATCHER cloning strategy proceeds by checking the intermediate plasmid library:
+
+**Intermediate plasmid** — the shRNA hairpin, poly-T tail, and barcode
+   (BC) are assembled into the intermediate plasmid backbone. At this stage
+   the read contains *both* the shRNA sequence *and* the BC, which makes it
+   possible to confirm that each BC is linked to the intended shRNA.
+
+`catcheR_sangerQC()` is used **at the intermediate plasmid stage**, before
+the final cloning step is complete. You pick bacterial colonies from the
+ligation plate, run colony PCR, and send the PCR product for Sanger
+sequencing. This function reads the resulting FASTA file and checks, for
+each well:
+
+- Was the insert present and readable?
+- Does the barcode match the expected BC for that well?
+- Does the shRNA sense/antisense sequence match the design?
+- Is the shRNA hairpin structurally valid (sense = reverse complement of
+  antisense)?
+- Were there any point mutations introduced during synthesis or cloning?
+- What was the sequencing quality in the BC and shRNA regions?
+
+This QC step tells you whether your ligation worked correctly **before** you
+invest time completing the cloning. It is especially important when:
+
+- You want to confirm that the BC and shRNA are correctly paired (no
+  barcode–shRNA swaps introduced during ligation).
+- You are comparing two ligation ratios (e.g. 1:12 vs 1:20 insert:vector)
+  and want to know which gives a higher correct-insert rate.
+- You want to detect any point mutations introduced during oligo synthesis
+  or PCR before propagating the plasmid library.
+
+---
+
+## What the sequencing read contains
+
+The intermediate plasmid is sequenced with the primer **p-sOPTiKD_SEQ-FW**
+(also called **siKDbc-seq_REV**), which reads the bottom strand 5'→3'. The
+resulting read therefore contains the molecular identifiers in this order,
+left to right:
+
+```
+5'(read) ── [vector] ── ACGCGT(MluI) ── [BC 8bp] ── [UCI 6bp] ──
+           GGCGCGCC·ATTTAAAT·GTCGAC(anchor) ── AAAAAAA(polyA) ──
+           [sense 21-22bp] ── CTCGAG(XhoI) ── [antisense 21-22bp] ──
+           [vector] ── 3'(read)
+```
+
+Key points:
+
+- The **BC** in the read is the reverse complement of the BC sequence in
+  the design TOP OLIGO. `catcheR_sangerQC()` handles this automatically.
+- The **sense** and **antisense** regions appear in the same order as in
+  the design shRNA field — sense before the loop (CTCGAG), antisense after.
+- A valid shRNA hairpin requires `sense == RC(antisense)`. The function
+  checks this for every read and flags reads that fail as `INVALID HAIRPIN`.
+
+---
+
+## Anchor-based extraction
+
+`catcheR_sangerQC()` does not rely on fixed read positions. Instead it
+searches for the MCS anchor sequence:
+
+```
+GGCGCGCCATTTAAATGTCGAC
+```
+
+This is the reverse complement of `GTCGACATTTAAATGGCGCGCC` (SalI +
+SwaI + AscI) on the top strand. Up to 2 mismatches are allowed in the
+anchor search, which makes the extraction robust to occasional sequencing
+errors in the vector backbone.
+
+Once the anchor is located:
+
+- **BC**: 8 bp immediately to the left of the anchor in the read.
+- **UCI**: 6 bp to the left of the BC.
+- **Sense**: sequence between the end of the anchor (which closes with
+  GTCGAC) and the CTCGAG (XhoI/loop), after stripping leading A's from the
+  poly-A tail.
+- **Antisense**: 21–22 bp immediately after CTCGAG.
+
+---
+
+## Required inputs
+
+| File | Description |
+|------|-------------|
+| FASTA file | Sanger sequences, one entry per well. Headers must end with the well ID preceded by `_` (e.g. `>KYO483_73984833_A1`). |
+| Design Excel | Plate layout Excel file. Must contain a sheet (default `"Plate 01"`) with columns for well position, oligo name, and the full TOP OLIGO sequence. |
+| ABI/PHD ZIP (optional) | ZIP archive of ABI output files including `.phd.1` quality files. When provided, the function reports minimum and mean Phred quality scores in the BC and shRNA regions. |
+
+The design Excel is the same file used to order the oligos. `catcheR_sangerQC()`
+parses the TOP OLIGO sequence to extract the expected BC and shRNA for each
+well, so no separate barcode reference file is needed.
+
+---
+
+## Basic usage
+
+```{r basic}
+library(catcheR)
+
+result <- catcheR_sangerQC(
+  fasta        = "11109801799-1.fasta",
+  design_xlsx  = "EB003C_DES01_shRNA_tdark_Ligation.xlsx",
+  output_dir   = "Output/",
+  sample_name  = "plate1_ligation",
+  plate_sheet  = "Plate 01",
+  abi_zip      = "11109801799-1_SCF_SEQ_ABI.zip"  # optional but recommended
+)
+```
+
+---
+
+## Comparing ligation conditions
+
+If your plate is divided between two ligation ratios (e.g. columns 1–6 =
+1:12, columns 7–12 = 1:20), set `ligation_split` accordingly. The function
+reports pass rates separately for each condition.
+
+```{r ligation}
+result <- catcheR_sangerQC(
+  fasta          = "11109801799-1.fasta",
+  design_xlsx    = "EB003C_DES01_shRNA_tdark_Ligation.xlsx",
+  output_dir     = "Output/",
+  sample_name    = "plate1_1-12_vs_1-20",
+  plate_sheet    = "Plate 01",
+  ligation_split = 6L,                    # cols 1-6 = condition A
+  ligation_labels = c("1:12", "1:20"),    # names for the two conditions
+  abi_zip        = "11109801799-1_SCF_SEQ_ABI.zip"
+)
+```
+
+The summary printed at the end shows pass rates per condition:
+
+```
+  1:12: 17/48 pass  |  1:20: 11/48 pass
+```
+
+---
+
+## Inspecting results in R
+
+The function returns a named list invisibly. All results are also
+auto-saved as `.rds` files in `R_objects/`.
+
+```{r inspect}
+# Full per-well result table
+result$results
+
+# Status counts
+result$summary
+
+# Show only passing wells
+result$results[grepl("^PASS", result$results$status), ]
+
+# Show wells with mutations in the BC
+result$results[!is.na(result$results$bc_mutations) &
+               result$results$bc_mutations != "", ]
+
+# Show wells where hairpin is invalid
+result$results[result$results$hairpin_ok == "FALSE", ]
+
+# Reload a previous run without re-running
+result <- readRDS(
+  "Output/sangerQC/260518_sangerQC_plate1_ligation/R_objects/sangerQC_result.rds"
+)
+```
+
+---
+
+## Output files
+
+All output is written to:
+
+```
+Output/sangerQC/YYMMDD_sangerQC_<sample_name>/
+  csv/
+    sanger_QC_results.csv       # full per-well result table
+  stats/
+    sanger_QC_summary.txt       # status counts and extraction parameters
+  R_objects/
+    sangerQC_result.rds         # full result list (reloadable)
+  to_scratch/
+    sanger_QC_results.csv       # copy for downstream use
+```
+
+The CSV contains one row per Sanger well with these columns:
+
+| Column | Description |
+|--------|-------------|
+| `sanger_well` | Well ID on the Sanger plate (A1–H12) |
+| `ligation` | Ligation condition for this well |
+| `seq_len` | Read length in bp |
+| `status` | QC call (see status codes below) |
+| `assigned_sh` | Matched shRNA name from the design |
+| `assigned_oligo_well` | Corresponding well in the design plate |
+| `bc_found` | Barcode extracted from the read |
+| `exp_bc_in_read` | Expected barcode in read orientation (RC of design BC) |
+| `bc_mm` | Mismatches between found and expected BC |
+| `bc_mutations` | Position and base change of each BC mismatch |
+| `sense_found` | Sense sequence extracted from the read |
+| `sense_mm` | Mismatches in sense region |
+| `sense_mutations` | Position and base change of each sense mismatch |
+| `anti_found` | Antisense sequence extracted from the read |
+| `anti_mm` | Mismatches in antisense region |
+| `anti_mutations` | Position and base change of each antisense mismatch |
+| `uci` | UCI sequence extracted from the read |
+| `hairpin_ok` | TRUE if sense == RC(antisense) |
+| `min_q_bc` | Minimum Phred quality in BC region (requires ABI ZIP) |
+| `mean_q_bc` | Mean Phred quality in BC region |
+| `min_q_sense` | Minimum Phred quality in sense region |
+| `mean_q_sense` | Mean Phred quality in sense region |
+| `anchor_mm` | Mismatches in anchor sequence |
+| `notes` | Additional flags (MluI mutation, BC/shRNA discordance) |
+
+---
+
+## Status codes
+
+| Status | Meaning | Action |
+|--------|---------|--------|
+| `PASS` | BC and shRNA both match perfectly (0 mm each) | Use this colony |
+| `PASS (1bp BC mut)` | shRNA perfect, 1 mismatch in BC | Likely OK — check `bc_mutations` column; if not in a critical position, use the colony |
+| `PASS (2bp BC mut)` | shRNA perfect, 2 mismatches in BC | Caution — verify that the BC still uniquely identifies this shRNA before using |
+| `PASS (1bp shRNA mut)` | BC perfect, 1 total shRNA mismatch | Likely OK — check `sense_mutations` / `anti_mutations`; if not in the seed region, may still be functional |
+| `PASS (2bp shRNA mut)` | BC perfect, 2 total shRNA mismatches | Caution — two mutations in the shRNA may affect silencing efficiency; sequence-verify before using |
+| `CHECK` | BC matches (0 mm) but shRNA has more mismatches than threshold | Inspect the actual sequence manually — could be a sequencing artefact in the hairpin region |
+| `INVALID HAIRPIN` | Sense ≠ RC(antisense) | The hairpin structure is broken; do not use this colony. Check sequencing quality in the shRNA region (`min_q_sense`) |
+| `shRNA OK / BC WRONG` | shRNA matches perfectly but BC has > 2 mm | Possible BC synthesis error or barcode swap; do not use without further investigation |
+| `BC/shRNA discordant` | BC and shRNA each match, but to different library members | Possible chimeric colony or mixed ligation; do not use |
+| `SEQ TRUNCATED` | Anchor sequence not found in the read | The read may be too short to reach the insert, or the insert was not cloned; pick another colony |
+| `SEQ FAILED` | Read shorter than 150 bp | Sequencing failed; re-sequence or pick another colony |
+
+---
+
+## Adjusting matching thresholds
+
+By default, a well is called `PASS` with up to 2 mismatches in the BC and
+up to 4 total mismatches in the shRNA (sense + antisense combined). You can
+tighten or relax these:
+
+```{r thresholds}
+# Strict: only perfect matches
+result_strict <- catcheR_sangerQC(
+  fasta         = "11109801799-1.fasta",
+  design_xlsx   = "EB003C_DES01_shRNA_tdark_Ligation.xlsx",
+  output_dir    = "Output/",
+  sample_name   = "plate1_strict",
+  bc_mm_pass    = 0L,    # no BC mismatches allowed for PASS
+  shrna_mm_pass = 0L     # no shRNA mismatches allowed for PASS
+)
+
+# Lenient: allow more mismatches (useful for very short reads)
+result_lenient <- catcheR_sangerQC(
+  fasta         = "11109801799-1.fasta",
+  design_xlsx   = "EB003C_DES01_shRNA_tdark_Ligation.xlsx",
+  output_dir    = "Output/",
+  sample_name   = "plate1_lenient",
+  bc_mm_pass    = 2L,
+  shrna_mm_pass = 6L
+)
+```
+
+---
+
+## Using quality scores to interpret borderline results
+
+When you provide the ABI ZIP file, the columns `min_q_bc`, `mean_q_bc`,
+`min_q_sense`, and `mean_q_sense` give you the Phred quality scores in the
+extracted regions. A Phred score of 30 or above (error rate < 0.1%) is
+generally considered reliable. A score below 20 (error rate > 1%) in the
+BC region should make you sceptical of mismatches reported there.
+
+```{r quality}
+# Wells where BC mismatches may be sequencing errors (low quality)
+result$results[
+  result$results$bc_mm > 0 &
+  !is.na(result$results$min_q_bc) &
+  result$results$min_q_bc < 20,
+  c("sanger_well","assigned_sh","bc_mm","min_q_bc","bc_mutations","status")
+]
+```
+
+---
+
+## Next steps
+
+After confirming correct colonies by Sanger QC:
+
+1. Pick and expand the colonies that passed.
+2. Complete the final cloning step (transfer insert into final backbone).
+3. Run `catcheR_step1QC()` on the intermediate pool FASTQ to detect any
+   barcode–shRNA swaps at scale across the full library.
+4. Proceed to `catcheR_step2QC_extraction()` after the final plasmid pool
+   is sequenced.
+
+---
+
+## Full parameter reference
+
+```{r params}
+catcheR_sangerQC(
+  fasta           = "sequences.fasta",   # FASTA with Sanger reads
+  design_xlsx     = "design.xlsx",       # Design Excel with TOP OLIGO column
+  output_dir      = "Output/",           # Root output directory
+  sample_name     = NULL,                # Optional label added to run folder
+  plate_sheet     = "Plate 01",          # Excel sheet name
+  oligo_col       = 2L,                  # 0-based column index of oligo name
+  sequence_col    = 4L,                  # 0-based column index of TOP OLIGO
+  first_row       = 8L,                  # 0-based row of first oligo
+  last_row        = 67L,                 # 0-based row of last oligo
+  ligation_split  = 6L,                  # Column split between ligation conditions
+  ligation_labels = c("1:12", "1:20"),   # Names of the two ligation conditions
+  anchor          = "GGCGCGCCATTTAAATGTCGAC",  # MCS anchor in the read
+  anchor_mm       = 2L,                  # Max mismatches in anchor search
+  bc_mm_pass      = 2L,                  # Max BC mm for PASS call
+  shrna_mm_pass   = 4L,                  # Max shRNA total mm for PASS call
+  min_read_len    = 150L,                # Minimum read length to attempt extraction
+  abi_zip         = NULL,                # Optional ZIP with PHD quality files
+  phd_prefix      = NULL,                # Auto-detected from ZIP contents
+  sh_id_prefix    = "siKDBC_"            # Prefix stripped from oligo names
+)
+```

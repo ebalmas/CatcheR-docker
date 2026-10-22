@@ -1,0 +1,328 @@
+---
+title: "CATCHER on 10x Genomics"
+subtitle: "`catcheR_tenxcatch` worked example"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    df_print: kable
+params:
+  analysis_dir:    "analysis_EB_10X"
+  scratch:         "scratch"
+  output:          "Output"
+  to_scratch:      true
+  sample_name:     "AB019a"
+  fastq_r1:        "AB019a_BC_S2_L001_R1_001.fastq.gz"
+  fastq_r2:        "AB019a_BC_S2_L001_R2_001.fastq.gz"
+  barcodes_genes:  ["rc_barcodes_genes_set1.csv", "rc_barcodes_genes_set2.csv"]
+  set_names:       ["set1", "set2"]
+  set_sizes:       [100, 60]
+  cell_whitelist:  "tenx_called_barcodes.txt"
+  percentage:      15
+  ratio:           2
+  umi_count:       1
+  min_cell_umi:    20
+  max_edit_distance: 1
+  jitter:          "auto"
+  max_reads:       ~
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, fig.align = "center")
+library(catcheR); library(ggplot2); library(knitr)
+
+## Folder layout -------------------------------------------------------------
+##   analysis_EB_10X/
+##     scratch/   <- every input listed below
+##     Output/    <- everything this document writes
+SCRATCH <- file.path(params$analysis_dir, params$scratch)
+OUT     <- file.path(params$analysis_dir, params$output)
+dir.create(OUT, showWarnings = FALSE, recursive = TRUE)
+show <- function(f, ext = "jpg") {
+  p <- file.path(OUT, paste0(f, ".", ext))
+  if (file.exists(p)) knitr::include_graphics(p) else invisible(NULL)
+}
+MAXR <- if (is.null(params$max_reads)) Inf else as.numeric(params$max_reads)
+theme_set(theme_minimal(base_size = 9))
+```
+
+# The pipeline, and where this document sits in it
+
+Four steps, in this order. Each one consumes what the previous produced, and
+nothing here re-reads the FASTQ after the first step.
+
+| # | step | reads | produces | needed by |
+|---|---|---|---|---|
+| 1 | `catcheR_tenxcatch()` | the FASTQ pair, the barcode-to-gene CSVs and the called-cell list (which doubles as the correction whitelist) | the `parsecatch` object (`.rds`), `complete_table_fin`, the 13 catcheR plots and the QC panels | every step below |
+| 2 | `catcheR_tenx_filtercatch()` | the object from 1 | `ValidCell` at the chosen thresholds, `cells_with_at_least_1_UCI.csv`, `new_cell_names.csv` | steps 3 and 4 |
+| 3 | `catcheR_tenx_nocatch()` | the object from 1 **and** the filter from 2 | the empty-vector cells, i.e. the unperturbed control set | step 4 (optional) |
+| 4 | `catcheR_tenx_seurat()` | the filter from 2, the empty set from 3, and Cell Ranger's `filtered_feature_bc_matrix.h5`, or the MatrixMarket triple | the Seurat object with `catcheR_status` on every cell | your downstream analysis |
+
+**Why the order matters.** Step 3 needs step 2 because an "empty" cell is
+defined as one that is *not* in the called set: without the filter there is
+nothing to subtract from. Step 4 needs step 2 for the same reason and step 3
+only if you want the controls labelled rather than left as `not_detected`.
+
+**What can be repeated cheaply.** Steps 2 to 4 all act on the object, so
+re-filtering at new thresholds costs seconds and never re-streams the reads.
+Only step 1 is expensive.
+
+## Where the files go
+
+```
+analysis_EB_10X/
+  scratch/                       <- inputs, plus the handoff copies below
+  Output/
+    tenxcatch/                 <- step 1: this chemistry's own folder
+      filtercatch_p15_u1_r2_f20/ <- step 2, tagged with its thresholds
+```
+
+Step 1 nests under the chemistry name so that running the Parse or PIPseq
+pipeline into the same `Output/` cannot overwrite these files - the 13 plots
+carrying catcheR's own names have no chemistry in the filename. Step 2 adds a
+folder named for its thresholds, so a second attempt at different values sits
+beside the first instead of replacing it.
+
+Three files are *inputs to a later step* rather than deliverables:
+`cells_with_at_least_1_UCI.csv`, `new_cell_names.csv` and
+`complete_table_fin_<sample>.csv`. With `to_scratch: true` they are copied into
+`scratch/` as `<name>_tenxcatch_<sample>.csv`, so two pipelines can
+share one scratch without colliding. The originals stay in `Output/`.
+
+## One trap in the thresholds
+
+`UMI.count` and `percentage` exclude with a strict `>`, `min.cell.UMI` includes
+with `>=`. So `UMI.count = 1` keeps pairs of **two or more** UMIs, a UCI at
+exactly 15% does **not** pass `percentage = 15`, and a cell with exactly 20
+cassette UMIs **does** pass `min.cell.UMI = 20`. The floor keeps
+applying by default: step 2 also defaults it to 20, so it stays in force unless
+you pass another value (`0` disables it). This document passes it explicitly at
+both steps, so the YAML header is the single source of truth.
+
+# What this document does
+
+`catcheR_tenxcatch()` is the native R entry point for 10x Genomics barcode
+enrichment libraries. It replaces the original `catcheR_10Xcatch()`, which
+drove bundled shell scripts through `system()` and wrote its intermediates
+into the input folder; this one streams the FASTQ in R, writes only into
+`Output/`, and shares its whole downstream half with the PIPseq and Parse
+entry points.
+
+Everything is built from the parameters in the header, so running another
+sample means changing `sample_name` and the FASTQ names — nothing in the body
+needs editing.
+
+# Inputs
+
+```{r inputs}
+need <- c(params$fastq_r1, params$fastq_r2, params$barcodes_genes,
+          params$cell_whitelist)
+inv <- data.frame(
+  file    = need,
+  role    = c("read 1 - cell barcode + UMI", "read 2 - cassette",
+              rep("barcode-to-gene reference", length(params$barcodes_genes)),
+              "Cell Ranger called cells"),
+  exists  = file.exists(file.path(SCRATCH, need)),
+  size_MB = round(file.size(file.path(SCRATCH, need)) / 1024^2, 1))
+stopifnot(all(inv$exists))
+kable(inv, caption = sprintf("Inputs found in %s", SCRATCH))
+```
+
+The cell list can be given three ways, and the same file serves as both the
+error-correction whitelist and the called-cell denominator:
+
+| source | how to pass it |
+|---|---|
+| `barcodes.tsv.gz` from `filtered_feature_bc_matrix/` | `cell.whitelist = "barcodes.tsv.gz"` |
+| a plain text file, one barcode per line | as above (this template's default) |
+| `filtered_feature_bc_matrix.h5` | same argument; needs the `hdf5r` package |
+
+Suffixes like `-1` are stripped on read, so either form works.
+
+# Extraction and first-stage QC
+
+One pass over the read pair. This is the only expensive step — roughly 15
+minutes for a 28 M pair library — so the chunk is cached: re-knitting to adjust
+a plot or a threshold does not re-read the FASTQ. Set `max_reads` in the header
+to a few million for a dry run.
+
+```{r tenxcatch, cache=TRUE}
+res <- catcheR_tenxcatch(
+  folder            = SCRATCH,
+  fastq.read1       = params$fastq_r1,
+  fastq.read2       = params$fastq_r2,
+  barcodes.genes    = params$barcodes_genes,
+  set.names         = params$set_names,
+  set.sizes         = as.integer(params$set_sizes),
+  # the same list twice, on purpose: as the whitelist it error-corrects the
+  # barcode; as called.cells it fixes the denominator of the final panels
+  cell.whitelist    = file.path(SCRATCH, params$cell_whitelist),
+  called.cells      = file.path(SCRATCH, params$cell_whitelist),
+  output_dir        = OUT,
+  sample_name       = params$sample_name,
+  percentage        = params$percentage,
+  ratio             = params$ratio,
+  UMI.count         = params$umi_count,
+  min.cell.UMI      = params$min_cell_umi,
+  max.edit.distance = params$max_edit_distance,
+  jitter            = params$jitter,
+  max.reads         = MAXR,
+  verbose           = FALSE)
+# The entry point nests its outputs one level down, under the chemistry name,
+# so another pipeline writing into the same Output/ cannot overwrite these.
+# Take the path from the object rather than rebuilding it here.
+OUT <- res$output_dir
+res
+```
+
+## Where the reads went
+
+```{r read-classes}
+kable(res$read_class, caption = "Read fates")
+```
+
+```{r funnel, fig.cap="Read fates, each stage a subset of the one above"}
+show("tenxcatch_detection_funnel", "png")
+```
+
+## Construct geometry as the data confirms it
+
+Read 1 is `[cell barcode 16][UMI 12] …` at fixed offsets — the same slice the
+original shell pipeline cut with `cut -c 1-16` and `cut -c 17-28`. Read 2
+carries the cassette as `rc(reference) rc(UCI) rc(barcode) constant …`, and
+those fields are read relative to the **vector constant**, not to the
+reference, so a read carrying a sequencing error inside the reference anchor is
+still recovered with the right barcode.
+
+```{r geometry}
+p <- res$params
+kable(data.frame(
+  field = c("reference", "empty reference", "vector constant", "UCI length",
+            "barcode length", "cell barcode length", "UMI length",
+            "barcode correction radius"),
+  value = c(p$reference, p$empty.reference, p$constant, p$UCI.length,
+            p$barcode.length, p$cb.length, p$umi.length, p$max.edit.distance)))
+```
+
+## Which barcodes are cells
+
+The knee separates real cells from the ambient floor. On 10x the whitelist *is*
+Cell Ranger's called-cell list, so the two agree by construction — the panel is
+still worth reading for where the knee falls relative to the UMI floor.
+
+```{r rank, fig.cap="Barcode-rank curve against the called-cell count"}
+show("tenxcatch_barcode_rank", "png")
+```
+
+## Would more sequencing help?
+
+Answered by subsampling the reads supporting each molecule, not by extrapolating
+a fitted curve past the data.
+
+```{r saturation, fig.cap="Rarefaction and marginal return"}
+show("tenxcatch_saturation", "png")
+```
+
+## Threshold suggestions
+
+```{r thresholds}
+thr <- res$thresholds
+kable(data.frame(
+  quantity = c("(cell, UCI) pairs", "single-UMI pairs", "% single-UMI",
+               'mode = "noise" would pick', 'mode = "bimodal" would pick',
+               "applied (UMI.count)", "applied (min.cell.UMI)"),
+  value = c(thr$pairs, thr$singletons, round(thr$pct_singletons, 1),
+            thr$noise, thr$bimodal, params$umi_count, params$min_cell_umi)),
+  caption = "Threshold estimators (NA = the estimator found nothing to cut on)")
+```
+
+```{r diag, fig.cap="Call accuracy and the percentage sweep"}
+show("tenxcatch_call_accuracy", "png"); show("tenxcatch_threshold_sweep", "png")
+```
+
+# The thirteen catcheR plots
+
+Written under catcheR's own file names, as `.jpg` and `.pdf`, so a 10x figure
+from this pipeline can be dropped in beside one from the original.
+
+```{r plots-1}
+for (f in c("barcode_distribution", "gene_distribution", "UMIxUCI", "UCIxcell",
+            "percentage_of_UMIxUCI_dist", "2D_percentage_of_UMIxUCI_UMI_count")) show(f)
+```
+
+# Cell filtering
+
+```{r filter}
+flt <- catcheR_tenx_filtercatch(res,
+  # the files a later step reads are copied into scratch/, renamed with the
+  # chemistry and the sample, so several pipelines can share one scratch
+  to.scratch   = if (isTRUE(params$to_scratch)) SCRATCH else NULL,
+  UMI.count = params$umi_count, percentage = params$percentage,
+  ratio = params$ratio, min.cell.UMI = params$min_cell_umi,
+  output_dir = OUT, jitter = params$jitter, verbose = FALSE)
+kable(flt$filter_returns, caption = "What the filter returns at each threshold")
+```
+
+```{r plots-2}
+show("2D_percentage_of_UMIxUCI_UMI_count_thresholds"); show("true_UCIxcell")
+show("cellsxclone"); show("2D_percentage_of_UMIxUCI_UMI_count_ValidCells")
+```
+
+# Unperturbed cells
+
+```{r nocatch}
+noc <- catcheR_tenx_nocatch(res, filtered = flt, verbose = FALSE)
+```
+
+# Judged against the cells Cell Ranger actually called
+
+```{r called-comp, fig.cap="Clone composition of the called cells"}
+show("tenxcatch_called_composition", "png")
+```
+
+```{r called-floor, fig.cap="The UMI-floor panel restricted to called cells"}
+show("tenxcatch_UCI_per_cell_called", "png")
+```
+
+```{r called-yield, fig.cap="Yield against expected wrong calls"}
+show("tenxcatch_yield_vs_error", "png")
+```
+
+# Join to the expression matrix
+
+Optional, and skipped automatically when the Cell Ranger files are not in
+`scratch/`. Cell Ranger writes `barcodes.tsv.gz` as the 16 nt barcode with a
+`-1` suffix; the suffix is stripped on both sides, so the join is a plain
+string match.
+
+```{r seurat}
+gex <- file.path(SCRATCH, c("matrix.mtx.gz", "features.tsv.gz", "barcodes.tsv.gz"))
+if (all(file.exists(gex))) {
+  obj <- catcheR_tenx_seurat(res, filtered = flt, empty = noc,
+                             mtx = gex[1], features = gex[2], cells = gex[3],
+                             sample_id = params$sample_name,
+                             project = params$sample_name,
+                             rename = TRUE, subset.valid = TRUE,
+                             output_dir = OUT, verbose = TRUE)
+} else {
+  message("Cell Ranger matrix not found in scratch/ - skipping the join.")
+}
+```
+
+When you scale this to several samples, attach the metadata to each object
+*before* `merge(..., add.cell.ids = ...)`. The merge prefixes every barcode
+with the sample id, after which the 16 nt key no longer matches.
+
+# Files written
+
+```{r manifest}
+f <- list.files(OUT)
+kable(data.frame(file = f,
+                 size_KB = round(file.size(file.path(OUT, f)) / 1024, 1)),
+      caption = sprintf("Contents of %s", OUT))
+```
+
+```{r session}
+sessionInfo()
+```

@@ -1,0 +1,13 @@
+{
+  "catcheR_ref": "724ef8900a6edb31136a7b0ccf4d3d5e3ba18dbe",
+  "catcheR_source": "https://github.com/ebalmas/catcheR/tree/V4",
+  "R_version": "4.5.2",
+  "Bioconductor_version": "3.22",
+  "CRAN_snapshot": "https://p3m.dev/cran/__linux__/noble/2026-03-10",
+  "platform": "linux/amd64",
+  "source_sha256": {
+    "scMAGeCK.tar.gz": "ecfed7c35e615945752014dee726fd7f8106236f1d8cbd403f7b5844cb8255e7",
+    "SeuratWrappers.tar.gz": "55298abfe08b666ceda9c7d17a01fa98551978a7b57bbc3b668f8a1ef983755c",
+    "catcheR.tar.gz": "4d10df4c07e7f79655222ac70e5f2dd65ad339433055d425a9ecf70190e29ea7"
+  }
+}

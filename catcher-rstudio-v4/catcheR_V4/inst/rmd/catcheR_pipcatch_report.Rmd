@@ -1,0 +1,602 @@
+---
+title: "catcheR_pipcatch: PIPseq barcode/UCI extraction and QC"
+subtitle: "Step-by-step port of catcheR_10Xcatch to Fluent PIPseq"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 2
+    number_sections: true
+    df_print: paged
+    fig_width: 9
+params:
+  fastq_r1: "AB019b_BC_S4_L001_R1_001.fastq.gz"
+  fastq_r2: "AB019b_BC_S4_L001_R2_001.fastq.gz"
+  ref_csv:  !r c("rc_barcodes_genes_set1.csv", "rc_barcodes_genes_set2.csv")
+  set_names: !r c("set1", "set2")
+  set_sizes: !r c(100L, 60L)
+  outdir: "pipcatch_out"
+  reference: "GGCGCGTTCATCTGGGGGAGCCG"
+  empty_reference: "TACGCGTTCATCTGGGGGAGCCG"
+  constant: "ACGCGTAGCTCGCTGATCAG"
+  uci_length: 6
+  barcode_length: 8
+  percentage: 15
+  ratio: 2
+  umi_count: 0
+  chunk_reads: 1000000
+  max_reads: Inf
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.align = "center", dpi = 150)
+library(dplyr); library(tidyr); library(ggplot2); library(readr)
+library(stringr); library(knitr); library(patchwork)
+theme_set(theme_minimal(base_size = 9) +
+          theme(panel.grid.minor = element_blank(),
+                plot.title = element_text(size = 9, hjust = 0)))
+dir.create(params$outdir, showWarnings = FALSE, recursive = TRUE)
+op <- function(f) file.path(params$outdir, f)
+```
+
+# What this document does
+
+`catcheR_10Xcatch` reads the CATCHER cassette off the 3' end of `R1 + revcomp(R2)`
+as `[barcode 8][UCI 6][reference 23]`, taking the cell ID from a fixed slice of
+10X R1 (`cut -c 1-16`) and the UMI from `cut -c 17-28`.
+
+PIPseq breaks the fixed-slice assumption: the cell barcode is built from four
+tiers separated by constant linkers and preceded by 0–3 phasing bases, so the
+fields are not at fixed offsets. This document is the PIPseq equivalent —
+`catcheR_pipcatch` — run end to end on one library, producing every QC table and
+figure in `r params$outdir`.
+
+**Run time.** One pass over an 18 M read-pair library takes roughly 20–40 min in
+base R. The streaming chunk is cached (`cache = TRUE`); set `max_reads` in the
+YAML header to a few million for a fast dry run.
+
+```{r step0-params}
+tibble::tibble(
+  parameter = c("R1", "R2", "reference", "empty reference", "constant",
+                "UCI length", "barcode length", "percentage", "ratio", "UMI count"),
+  value = c(basename(params$fastq_r1), basename(params$fastq_r2),
+            params$reference, params$empty_reference, params$constant,
+            params$uci_length, params$barcode_length,
+            params$percentage, params$ratio, params$umi_count)
+) |> kable(caption = "Run parameters")
+```
+
+# Step 1 — Construct geometry
+
+The cassette sits between the vector's MluI site and the reference. In forward
+construct orientation:
+
+```
+... GCTGATCAG CGAGCTACGCGT [barcode 8] [UCI 6] GGCGCGT TCATCTGGGGGAGCCG
+                           \_______ 21 nt insert ________/
+```
+
+Because R2 is sequenced from the enrichment primer, it reads the reverse
+complement of this, so the construct fields land at *fixed* offsets at the start
+of R2 — that part of the 10X design carries over unchanged.
+
+```{r step1-geometry}
+revcomp <- function(x) vapply(strsplit(chartr("ACGTN", "TGCAN", x), NULL),
+                              function(z) paste(rev(z), collapse = ""), character(1))
+
+REF      <- params$reference
+RCREF    <- revcomp(REF)                    # expected at R2 positions 1-23
+RC_EMPTY <- revcomp(params$empty_reference) # no-insertion junction
+ANCH     <- substr(RCREF, 1, 15)            # invariant part, also the primer 3' end
+CONST    <- params$constant                 # vector sequence 3' of the barcode
+UL <- params$uci_length; BL <- params$barcode_length
+
+tibble::tibble(
+  `R2 position` = c("1-15", "16-23", paste0("24-", 23 + UL),
+                    paste0(24 + UL, "-", 23 + UL + BL), paste0(24 + UL + BL, "+")),
+  content = c(ANCH, substr(RCREF, 16, 23), "revcomp(UCI)", "revcomp(barcode)", CONST),
+  note = c("invariant; shared with the enrichment primer",
+           "discriminator: AACGCGCC = barcoded, AACGCGTA = empty",
+           paste(UL, "nt"), paste(BL, "nt"), "constant vector")
+) |> kable(caption = "Verified R2 layout")
+```
+
+**The empty reference must be tested first.** When no cassette is inserted the
+flanks fuse and regenerate `` `r params$empty_reference` ``. That junction also
+regenerates `CONST` 14 nt earlier than normal, so a classifier that searches for
+`CONST` before testing the empty reference silently files empty-vector reads as
+"unknown barcode".
+
+# Step 2 — PIPseq read 1 layout
+
+Read 1 is the cell barcode, not construct sequence. After stripping 0–3 phasing
+bases the layout is:
+
+```
+[phase 0-3] bc1(8) ATG bc2(6) GAG bc3(6) TCGAG bc4(8) index(3) ACG (dT)n
+```
+
+```{r step2-parser}
+# Vectorised R1 parser. Returns the 28 nt concatenated 4-tier barcode.
+# `valid` requires the three linkers AND the downstream index + ACG + oligo-dT:
+# matching the linkers alone admits ~15x more reads, nearly all spurious.
+parse_r1 <- function(s1) {
+  n <- length(s1); phase <- rep(NA_integer_, n)
+  for (p in 0:3) {                                   # smallest phase wins
+    hit <- is.na(phase) &
+      substr(s1, p +  9, p + 11) == "ATG" &
+      substr(s1, p + 18, p + 20) == "GAG" &
+      substr(s1, p + 27, p + 31) == "TCGAG"
+    phase[which(hit)] <- p
+  }
+  ok <- !is.na(phase); ph <- ifelse(ok, phase, 0L)
+  dT <- substr(s1, ph + 46, ph + 53)
+  list(
+    linker_only = ok,
+    valid = ok & substr(s1, ph + 43, ph + 45) == "ACG" &
+            nchar(gsub("[^T]", "", dT)) >= 7,
+    cell  = paste0(substr(s1, ph +  1, ph +  8), substr(s1, ph + 12, ph + 17),
+                   substr(s1, ph + 21, ph + 26), substr(s1, ph + 32, ph + 39)),
+    index = substr(s1, ph + 40, ph + 42)
+  )
+}
+```
+
+> The 3 nt `index` is **not** a UMI. There are only 64 possible values and all of
+> them are observed, so it saturates immediately. Every metric below counts
+> **reads**, not indexes.
+
+# Step 3 — Classify every read
+
+```{r step3-classifier}
+classify_r2 <- function(s2, pos) {
+  sim <- integer(length(s2))                         # similarity to the 15 nt anchor
+  for (i in seq_len(15)) sim <- sim + (substr(s2, i, i) == substr(ANCH, i, i))
+  polyA <- grepl(strrep("A", 10), substr(s2, 1, 45), fixed = TRUE)
+  ifelse(startsWith(s2, RC_EMPTY), "empty vector (no insertion)",
+  ifelse(pos >= 15,                "cassette",
+  ifelse(sim >= 13,
+         ifelse(polyA, "primer + poly-A chimera", "primer, no cassette, no poly-A"),
+         ifelse(polyA, "non-construct insert (poly-A)", "non-construct insert"))))
+}
+```
+
+# Step 4 — Stream the FASTQ pair
+
+```{r step4-stream, cache=TRUE}
+stream_pair <- function(f1, f2, chunk = params$chunk_reads, max_reads = params$max_reads) {
+  c1 <- gzfile(f1, "r"); c2 <- gzfile(f2, "r")
+  on.exit({ close(c1); close(c2) })
+  tot <- 0L; done <- 0
+  cls_tot <- integer(0); cell_cls <- list(); cassette <- list(); k <- 0L
+  repeat {
+    l1 <- readLines(c1, n = chunk * 4L); if (!length(l1)) break
+    l2 <- readLines(c2, n = chunk * 4L)
+    s1 <- l1[seq(2, length(l1), 4)]; s2 <- l2[seq(2, length(l2), 4)]
+    tot <- tot + length(s1); k <- k + 1L
+
+    pr  <- parse_r1(s1); keep <- which(pr$valid)
+    v2  <- s2[keep]; pos <- regexpr(CONST, v2, fixed = TRUE)
+    cls <- classify_r2(v2, pos)
+    cell <- pr$cell[keep]
+
+    cls_tot <- { t <- table(cls); u <- union(names(cls_tot), names(t))
+                 setNames(replace(numeric(length(u)), match(names(cls_tot), u), cls_tot) +
+                          replace(numeric(length(u)), match(names(t), u), as.numeric(t)), u) }
+    cell_cls[[k]] <- as.data.frame(table(cell = cell, cls = cls), stringsAsFactors = FALSE) |>
+                     dplyr::filter(Freq > 0)
+    j <- which(cls == "cassette")
+    if (length(j))
+      cassette[[k]] <- data.frame(
+        cellID  = cell[j],
+        index   = pr$index[keep][j],
+        UCI_rc  = substr(v2[j], pos[j] - UL - BL, pos[j] - BL - 1L),
+        bc_rc   = substr(v2[j], pos[j] - BL,      pos[j] - 1L),
+        stringsAsFactors = FALSE)
+    done <- done + length(s1)
+    if (done >= max_reads) break
+  }
+  list(total_pairs = tot, class_counts = cls_tot,
+       cell_class  = bind_rows(cell_cls) |> count(cell, cls, wt = Freq, name = "n"),
+       cassette    = bind_rows(cassette))
+}
+
+st <- stream_pair(params$fastq_r1, params$fastq_r2)
+st$cassette$UCI     <- revcomp(st$cassette$UCI_rc)
+st$cassette$barcode <- revcomp(st$cassette$bc_rc)
+cat(sprintf("read pairs: %s | reads with a validated cell barcode: %s | distinct cell barcodes: %s\n",
+            format(st$total_pairs, big.mark = ","),
+            format(sum(st$class_counts), big.mark = ","),
+            format(dplyr::n_distinct(st$cell_class$cell), big.mark = ",")))
+```
+
+# Step 5 — Reference barcodes and their orientation
+
+The two pooled experiments ship as separate CSVs **written in opposite
+orientations**. Rather than hardcode which one needs reverse-complementing, the
+orientation is resolved against the reads themselves.
+
+```{r step5-reference}
+obs <- unique(st$cassette$barcode)
+refs <- lapply(seq_along(params$ref_csv), function(i) {
+  r <- read.csv(params$ref_csv[i], header = FALSE, col.names = c("barcode", "shRNA"),
+                strip.white = TRUE, colClasses = "character")
+  r$barcode <- toupper(trimws(r$barcode))
+  hit_fwd <- sum(r$barcode %in% obs); hit_rc <- sum(revcomp(r$barcode) %in% obs)
+  if (hit_rc > hit_fwd) { r$barcode <- revcomp(r$barcode); orient <- "reverse-complemented" }
+  else orient <- "as given"
+  r$set <- params$set_names[i]; r$csv_orientation <- orient
+  message(sprintf("%s: %d barcodes, %s (fwd hits %d, rc hits %d)",
+                  params$set_names[i], nrow(r), orient, hit_fwd, hit_rc))
+  r
+})
+ref <- bind_rows(refs)
+stopifnot(!any(duplicated(ref$barcode)))          # no collisions after merging
+ref <- ref |> mutate(gene = sub("_[^_]*$", "", shRNA),
+                     idx  = suppressWarnings(as.integer(sub(".*_", "", shRNA))),
+                     construct = shRNA)
+dup <- ref |> count(shRNA) |> filter(n > 1) |> pull(shRNA)
+ref$construct[ref$shRNA %in% dup] <- paste0(ref$shRNA[ref$shRNA %in% dup],
+                                            " (", ref$set[ref$shRNA %in% dup], ")")
+write_csv(ref[, c("barcode", "shRNA")], op("rc_barcodes_genes_merged.csv"), col_names = FALSE)
+ref |> count(set, csv_orientation, name = "barcodes") |>
+  kable(caption = "Orientation resolved against the reads")
+```
+
+> Controls (`B2M`, `SCR1`, `SCR2`, `LUCIFERASE`, `ARHGDIA`) exist in **both**
+> CSVs with different barcodes. Always count constructs as `(set, shRNA)` pairs —
+> counting by `shRNA` name alone merges them.
+
+# Step 6 — Read-class summary
+
+```{r step6-classes}
+T_reads <- st$cassette |> left_join(ref, by = "barcode")
+assigned_cells <- unique(T_reads$cellID[!is.na(T_reads$shRNA)])
+
+cls_tab <- tibble::enframe(st$class_counts, name = "class", value = "reads") |>
+  mutate(reads = as.integer(reads),
+         class = ifelse(class == "cassette", "cassette (split below)", class))
+split_cass <- c("assigned" = sum(!is.na(T_reads$shRNA)),
+                "cassette present, barcode not in reference" = sum(is.na(T_reads$shRNA)))
+read_class <- bind_rows(cls_tab |> filter(class != "cassette (split below)"),
+                        tibble::enframe(split_cass, name = "class", value = "reads") |>
+                          mutate(reads = as.integer(reads))) |>
+  arrange(desc(reads)) |>
+  mutate(pct = round(100 * reads / sum(reads), 2))
+write_csv(read_class, op("pipcatch_read_class_summary.csv"))
+kable(read_class, caption = "Fate of every read carrying a validated cell barcode")
+```
+
+The 16–20 nt primer dimer that dominates the raw library is **absent** here: it
+carries no cell barcode at all. Among barcoded molecules the failure mode is the
+enrichment primer priming on polyadenylated cDNA, which size selection will not
+remove.
+
+# Step 7 — What the no-call cells contain
+
+```{r step7-nocall, fig.height=3.2, fig.width=10}
+# Split the "cassette" bucket per READ (a cell can hold both kinds), then pick each
+# cell's dominant class. Ties are broken by a FIXED priority, not by row order, so
+# the result does not depend on the order reads happened to arrive.
+CLASS_PRIORITY <- c("assigned", "cassette present, barcode not in reference",
+                    "empty vector (no insertion)", "primer + poly-A chimera",
+                    "primer, no cassette, no poly-A", "non-construct insert (poly-A)",
+                    "non-construct insert")
+cass_split <- T_reads |>
+  transmute(cell = cellID,
+            cls = ifelse(is.na(shRNA), "cassette present, barcode not in reference", "assigned")) |>
+  count(cell, cls, name = "n")
+cell_class <- bind_rows(filter(st$cell_class, cls != "cassette"), cass_split)
+den  <- n_distinct(cell_class$cell)
+asn  <- length(assigned_cells)
+nocall <- cell_class |> filter(!cell %in% assigned_cells) |>
+  mutate(prio = match(cls, CLASS_PRIORITY)) |>
+  group_by(cell) |> arrange(desc(n), prio, .by_group = TRUE) |>
+  slice(1) |> ungroup() |>
+  count(cls, name = "cells") |> arrange(desc(cells)) |>
+  mutate(pct = round(100 * cells / sum(cells), 1))
+
+uci_cell <- T_reads |> filter(!is.na(shRNA)) |> distinct(cellID, barcode, UCI) |>
+  count(cellID, name = "n_UCI")
+uci_tab <- uci_cell |> count(n_UCI, name = "cells") |>
+  mutate(pct = round(100 * cells / sum(cells), 1))
+
+pA <- ggplot(uci_tab, aes(factor(n_UCI), cells)) +
+  geom_col(fill = "#2E6E8E", width = .6) +
+  geom_text(aes(label = format(cells, big.mark = ",")), vjust = -.4, size = 2.5) +
+  scale_y_log10() + labs(x = "distinct UCIs in the cell", y = "cells",
+                         title = sprintf("%s cells with a call", format(asn, big.mark = ",")))
+pB <- ggplot(nocall, aes(cells, reorder(cls, cells))) +
+  geom_col(fill = "#B4432F", width = .65) +
+  geom_text(aes(label = sprintf("%s (%.1f%%)", format(cells, big.mark = ","), pct)),
+            hjust = -.08, size = 2.4) +
+  scale_x_continuous(expand = expansion(mult = c(0, .28))) +
+  labs(x = "cells (classified by their dominant read)", y = NULL,
+       title = sprintf("%s cells without a call", format(den - asn, big.mark = ",")))
+fig_nocall <- pA + pB + plot_layout(widths = c(1, 2))
+ggsave(op("pipcatch_nocall_fates.png"), fig_nocall, width = 10, height = 3.2, dpi = 300)
+fig_nocall
+```
+
+## UCIs per cell
+
+```{r step7-ucitable}
+kable(uci_tab, caption = "UCIs per called cell")
+```
+
+# Step 8 — Per-read assignments
+
+```{r step8-assignments}
+# One row per READ. The 3 nt index is carried for reference but is NOT used to
+# deduplicate: with only 64 possible values it collides constantly, and collapsing
+# on it would silently discard real molecules.
+assign_tbl <- T_reads |> filter(!is.na(shRNA)) |>
+  select(cell = cellID, idx = index, barcode, UCI, shRNA, set, gene)
+write_csv(assign_tbl, op("pipcatch_cell_assignments.csv"))
+cat(sprintf("assigned reads: %s | unique (cell, index, barcode, UCI): %s (%.0f%% index collision)\n",
+            format(nrow(assign_tbl), big.mark = ","),
+            format(nrow(distinct(assign_tbl)), big.mark = ","),
+            100 * (1 - nrow(distinct(assign_tbl)) / nrow(assign_tbl))))
+head(assign_tbl)
+```
+
+# Step 9 — Cell detection and library of origin
+
+The denominator is **validated** PIPseq barcodes seen in R1. It is a
+library-quality metric: a cell only enters this library through a read that
+reaches the R2 cassette. The fraction of *your* cells that received a
+perturbation call must be computed against PIPseeker's called-cell list
+(`barcodes.tsv`) from the gene-expression library.
+
+```{r step9-detection, fig.height=2.9, fig.width=9.6}
+depth <- assign_tbl |> count(cell, name = "reads") |>
+  mutate(bin = cut(reads, c(0, 1, 2, Inf), labels = c("1 read", "2 reads", ">=3 reads"))) |>
+  count(bin, name = "cells")
+d1 <- tibble::tibble(
+  grp = factor(c("shRNA barcode assigned", "no shRNA call"),
+               levels = c("shRNA barcode assigned", "no shRNA call")),
+  cells = c(asn, den - asn))
+pD <- ggplot(d1, aes(x = 1, y = cells, fill = grp)) +
+  geom_col(width = .45) +
+  geom_text(aes(label = sprintf("%s\n%.1f%%", format(cells, big.mark = ","),
+                                100 * cells / den)),
+            position = position_stack(vjust = .5), size = 2.6, colour = "white") +
+  scale_fill_manual(values = c("#2E6E8E", "#9AA5AD"), name = NULL) +
+  coord_flip() + labs(x = NULL, y = "validated PIPseq cell barcodes in read 1",
+                      title = sprintf("%s of %s cell barcodes carry an shRNA call",
+                                      format(asn, big.mark = ","), format(den, big.mark = ","))) +
+  theme(axis.text.y = element_blank(), legend.position = "top")
+setc <- assign_tbl |> distinct(cell, set) |> count(set, name = "cells") |>
+  left_join(tibble::tibble(set = params$set_names, n_shRNA = params$set_sizes), by = "set")
+pE <- ggplot(setc, aes(set, cells, fill = set)) +
+  geom_col(width = .55, show.legend = FALSE) +
+  geom_text(aes(label = sprintf("%s (%.0f%%)\n%.1f per shRNA",
+                                format(cells, big.mark = ","),
+                                100 * cells / sum(setc$cells), cells / n_shRNA)),
+            vjust = -.25, size = 2.5) +
+  scale_fill_manual(values = c("#2E6E8E", "#D1A13A")) +
+  scale_y_continuous(expand = expansion(mult = c(0, .28))) +
+  labs(x = NULL, y = "cells with an shRNA call", title = "Pooled library of origin")
+fig_det <- pD + pE + plot_layout(widths = c(1.5, 1))
+ggsave(op("pipcatch_cell_detection.png"), fig_det, width = 9.6, height = 2.9, dpi = 300)
+fig_det
+```
+
+# Step 10 — shRNA detection and clones per shRNA
+
+```{r step10-clones, fig.height=8.2, fig.width=5.4}
+clone_summary <- assign_tbl |>
+  group_by(set, gene, shRNA) |>
+  summarise(clones = n_distinct(UCI), cells = n_distinct(cell), .groups = "drop") |>
+  arrange(desc(clones), desc(cells))
+write_csv(clone_summary, op("pipcatch_shRNA_clone_summary.csv"))
+
+grid <- ref |> select(set, gene, shRNA, idx) |>
+  left_join(clone_summary, by = c("set", "gene", "shRNA")) |>
+  mutate(clones = tidyr::replace_na(clones, 0L), cells = tidyr::replace_na(cells, 0L),
+         gene = factor(gene, levels = rev(unique(ref$gene[order(match(ref$set, params$set_names))]))),
+         label = ifelse(clones == 0, "n.d.", as.character(clones)))
+fig_mat <- ggplot(grid, aes(factor(idx), gene, fill = cells)) +
+  geom_tile(colour = "white", linewidth = .5) +
+  geom_text(aes(label = label, colour = cells > max(grid$cells) * .55), size = 2.1,
+            show.legend = FALSE) +
+  scale_fill_gradient(low = "#F7FBFF", high = "#08306B", name = "cells") +
+  scale_colour_manual(values = c(`TRUE` = "white", `FALSE` = "#333333")) +
+  facet_grid(set ~ ., scales = "free_y", space = "free_y") +
+  labs(x = "shRNA within gene", y = NULL,
+       title = sprintf("%d of %d constructs detected, %d clones",
+                       sum(grid$clones > 0), nrow(grid), sum(grid$clones)),
+       subtitle = "number = distinct clones (UCIs); n.d. = in library, not detected") +
+  theme(panel.grid = element_blank(), axis.text.y = element_text(size = 6))
+ggsave(op("pipcatch_shRNA_clone_matrix.png"), fig_mat, width = 5.4, height = 8.2, dpi = 300)
+fig_mat
+```
+
+# Step 11 — Per-cell table
+
+One validated 4-tier barcode = one cell, so reads collapse to one row per cell
+before any call is made.
+
+```{r step11-percell}
+cu <- assign_tbl |> count(cell, barcode, UCI, shRNA, set, gene, name = "reads")
+per_cell <- cu |>
+  group_by(cell) |>
+  arrange(desc(reads), .by_group = TRUE) |>
+  summarise(top_barcode = first(barcode), top_UCI = first(UCI), top_shRNA = first(shRNA),
+            top_set = first(set), gene = first(gene),
+            reads_top = first(reads), reads_second = ifelse(n() > 1, nth(reads, 2), 0L),
+            reads_total = sum(reads), n_UCI = n(), n_sets = n_distinct(set),
+            .groups = "drop") |>
+  mutate(pct_top   = 100 * reads_top / reads_total,
+         ratio_top = ifelse(reads_second > 0, reads_top / reads_second, Inf))
+write_csv(per_cell, op("pipcatch_per_cell_table.csv"))
+tibble::tibble(
+  metric = c("cells", "median reads per cell", "max reads per cell",
+             "cells with 1 UCI", "cells with 2 UCIs", "cells with >2 UCIs",
+             "cells carrying both pooled sets"),
+  value  = c(nrow(per_cell), median(per_cell$reads_total), max(per_cell$reads_total),
+             sum(per_cell$n_UCI == 1), sum(per_cell$n_UCI == 2), sum(per_cell$n_UCI > 2),
+             sum(per_cell$n_sets > 1))
+) |> kable(caption = "Per-cell table summary")
+```
+
+# Step 12 — catcheR distributions
+
+Equivalents of `barcode_distribution.pdf` and `gene_distribution.pdf`, counting
+reads instead of UMIs.
+
+```{r step12-dist, fig.height=6.4, fig.width=10}
+bd <- assign_tbl |> left_join(distinct(ref, shRNA, set, construct), by = c("shRNA", "set")) |>
+  count(construct, name = "reads") |> arrange(desc(reads))
+gd <- assign_tbl |> count(gene, name = "reads") |> arrange(desc(reads))
+pbd <- ggplot(bd, aes(reorder(construct, -reads), reads)) +
+  geom_col(fill = "#2E6E8E") +
+  labs(x = NULL, y = "reads",
+       title = sprintf("barcode distribution - %d constructs detected of %d, %s reads",
+                       nrow(bd), nrow(ref), format(nrow(assign_tbl), big.mark = ","))) +
+  theme(axis.text.x = element_text(angle = 90, vjust = .5, hjust = 1, size = 3.6))
+pgd <- ggplot(gd, aes(reorder(gene, -reads), reads)) +
+  geom_col(fill = "#D1A13A") +
+  labs(x = NULL, y = "reads",
+       title = sprintf("gene distribution - %d targets (controls pool both sets)", nrow(gd))) +
+  theme(axis.text.x = element_text(angle = 90, vjust = .5, hjust = 1, size = 5))
+fig_dist <- pbd / pgd
+ggsave(op("pipcatch_QC_distributions.png"), fig_dist, width = 10, height = 6.4, dpi = 300)
+fig_dist
+```
+
+# Step 13 — catcheR thresholds
+
+`barcode_silencing_explorative_analysis.R` groups by `(cellID, UCI)`, counts
+UMIs, and picks a threshold automatically in one of two modes. Both are
+reproduced below on reads.
+
+```{r step13-thresholds}
+tab <- cu |> group_by(cell, UCI) |> summarise(readsxUCI = sum(reads), .groups = "drop") |>
+  left_join(cu |> count(cell, wt = reads, name = "readsxcell"), by = "cell") |>
+  mutate(pctxUCI = 100 * readsxUCI / readsxcell)
+
+U <- nrow(tab); one <- sum(tab$readsxUCI == 1); perc_1 <- 100 * one / U
+p_frac <- perc_1 / 100 * 1.35
+thr_noise <- if (p_frac >= 1) NA_integer_ else
+  min(sort(tab$readsxUCI, decreasing = TRUE)[seq_len(ceiling(U * (1 - p_frac)))])
+
+h <- as.data.frame(table(tab$readsxUCI), stringsAsFactors = FALSE)
+names(h) <- c("level", "count"); h$level <- as.integer(h$level)
+v <- h$count
+valley <- if (length(v) >= 3)
+  which(c(FALSE, v[-c(1, length(v))] < v[-c(length(v) - 1, length(v))] &
+                 v[-c(1, length(v))] <= v[-c(1, 2)], FALSE)) else integer(0)
+# NOTE: catcheR uses findValleys(...)[1] as the threshold, i.e. the histogram
+# POSITION. That equals the read/UMI count only when levels are contiguous.
+# Read the level instead:
+thr_bimodal <- if (length(valley)) h$level[valley[1]] else NA_integer_
+
+tibble::tibble(
+  quantity = c("(cell, UCI) pairs", "pairs with 1 read", "% with 1 read",
+               'threshold, mode = "noise"', 'threshold, mode = "bimodal"'),
+  value = c(U, one, sprintf("%.1f%%", perc_1),
+            ifelse(is.na(thr_noise), "undefined (>74.07% singletons)", thr_noise),
+            ifelse(is.na(thr_bimodal), "no valley", thr_bimodal))
+) |> kable(caption = "Automatic threshold estimation")
+```
+
+> **Guard worth adding to `pipcatch`.** The noise estimator computes
+> `p = perc_1/100 * 1.35` and keeps `ceiling(nrow * (1 - p))` rows. Once more
+> than 1/1.35 = **74.07%** of pairs are singletons, `1 - p` is negative and the
+> subset `UMIxUCI[1:n, ]` errors in R. Refuse with a depth message instead.
+
+## Filtering and validity
+
+```{r step13-filter}
+run_filter <- function(thr) {
+  t <- tab |> mutate(TorF = pctxUCI > params$percentage & readsxUCI > thr) |>
+    group_by(cell) |> mutate(True_UCIxcellID = sum(TorF)) |> ungroup()
+  v <- t |> group_by(cell) |>
+    summarise(True_UCIxcellID = first(True_UCIxcellID),
+              mx = max(readsxUCI),
+              second = if (n() > 1) sort(readsxUCI, decreasing = TRUE)[2] else NA_real_,
+              pct_at_max = pctxUCI[which.max(readsxUCI)], .groups = "drop") |>
+    mutate(ValidCell = True_UCIxcellID == 1 &
+             ((!is.na(second) & mx / second >= params$ratio) | pct_at_max == 100))
+  list(pairs = t, cells = v)
+}
+thr_grid <- c(`recommended at this depth` = 0L,
+              `catcheR's lowest meaningful value (comparison is strict >)` = 1L)
+if (!is.na(thr_bimodal)) thr_grid[['automatic "bimodal" pick']] <- thr_bimodal
+filter_returns <- bind_rows(lapply(seq_along(thr_grid), function(i) {
+  r <- run_filter(thr_grid[[i]])
+  tibble::tibble(threshold = thr_grid[[i]],
+                 TorF_pairs = sum(r$pairs$TorF),
+                 cells_with_true_UCI = sum(r$cells$True_UCIxcellID > 0),
+                 ValidCell = sum(r$cells$ValidCell),
+                 note = names(thr_grid)[i])
+}))
+write_csv(filter_returns, op("pipcatch_filter_returns.csv"))
+kable(filter_returns, caption = "What the filter returns")
+
+res <- run_filter(params$umi_count)
+complete_table_fin <- res$pairs |> left_join(res$cells |> select(cell, ValidCell), by = "cell")
+write_csv(complete_table_fin, op("pipcatch_complete_table_fin.csv"))
+```
+
+```{r step13-fig, fig.height=6.6, fig.width=9.6}
+p1 <- ggplot(h, aes(level, count)) + geom_col(fill = "grey45", width = .7) +
+  scale_y_log10() + scale_x_continuous(breaks = h$level) +
+  { if (!is.na(thr_bimodal)) geom_vline(xintercept = thr_bimodal + .5, colour = "#B4432F") } +
+  labs(x = "readsxUCI", y = "(cell, UCI) pairs", title = "readsxUCI (catcheR UMIxUCI)")
+p2 <- ggplot(tab, aes(pctxUCI)) + geom_histogram(binwidth = 2, fill = "grey45") +
+  scale_y_log10() + geom_vline(xintercept = params$percentage, colour = "#B4432F") +
+  labs(x = "read percentage x UCI", y = "(cell, UCI) pairs",
+       title = sprintf("percentage per UCI (minimum %.0f%%)", min(tab$pctxUCI)))
+d2 <- complete_table_fin |> count(pctxUCI, readsxUCI, True_UCIxcellID, ValidCell, name = "n")
+p3 <- ggplot(d2, aes(pctxUCI, readsxUCI, size = n, colour = factor(True_UCIxcellID))) +
+  geom_point(alpha = .55) + scale_y_log10() + scale_size_area(max_size = 9, guide = "none") +
+  geom_vline(xintercept = params$percentage, colour = "#B4432F", linewidth = .3) +
+  labs(colour = "True_UCIxcellID", title = "coloured by true UCIs per cell")
+p4 <- ggplot(d2, aes(pctxUCI, readsxUCI, size = n, colour = ValidCell)) +
+  geom_point(alpha = .55) + scale_y_log10() + scale_size_area(max_size = 9, guide = "none") +
+  scale_colour_manual(values = c(`TRUE` = "#D1A13A", `FALSE` = "#8FA8BF")) +
+  geom_vline(xintercept = params$percentage, colour = "#B4432F", linewidth = .3) +
+  labs(title = "coloured by ValidCell")
+fig_thr <- (p1 | p2) / (p3 | p4) +
+  plot_annotation(title = sprintf("threshold %s, percentage %s, ratio %s - %s of %s cells valid",
+                                  params$umi_count, params$percentage, params$ratio,
+                                  format(sum(res$cells$ValidCell), big.mark = ","),
+                                  format(nrow(res$cells), big.mark = ",")),
+                  theme = theme(plot.title = element_text(size = 9)))
+ggsave(op("pipcatch_QC_thresholds.png"), fig_thr, width = 9.6, height = 6.6, dpi = 300)
+fig_thr
+```
+
+# Step 14 — Outputs
+
+```{r step14-manifest}
+tibble::tibble(file = list.files(params$outdir)) |>
+  mutate(size_kb = round(file.size(file.path(params$outdir, file)) / 1024, 1)) |>
+  kable(caption = "Files written")
+```
+
+# Known limitations
+
+1. **Barcode error correction is not applied.** Tiers are validated structurally
+   but not against PIPseeker's whitelists, so a single error in `bc1` or `bc4`
+   creates a barcode that passes and belongs to no real cell. Correct each tier
+   against the whitelist, then key on the translated 16 nt cell ID
+   (`metrics/barcodes/barcode_whitelist.txt`) — that is what the expression-matrix
+   columns use.
+2. **No UMI deduplication.** The 3 nt index is not a UMI; confirm the chemistry
+   (`pipseeker --chemistry v3/v4/v5`).
+3. **`catcheR_nocatch` cannot run at this depth.** Empty-vector reads are far too
+   few to populate a negative-control set, and a cell with no call is far more
+   likely to have lost its construct read to primer mispriming.
+4. **Depth, not thresholds, is the limit.** Fixing the dimer by size selection
+   and the mispriming by a nested or higher-stringency enrichment PCR are the two
+   levers; the automatic threshold modes become usable again once the
+   `readsxUCI` histogram develops a genuine valley.
+
+```{r session}
+sessionInfo()
+```

@@ -1,0 +1,10 @@
+{
+  "rstudio_sign_in_http_status": 200,
+  "rstudio_user_R_and_source_access": true,
+  "host_sees_container_output": true,
+  "single_bind_mount": true,
+  "shared_folder_path_with_spaces": true,
+  "output_persists_after_stop": true,
+  "image": "hedgelab/catcher-rstudio:v4-724ef89",
+  "completed_utc": "2026-10-20T23:28:21Z"
+}

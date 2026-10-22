@@ -1,0 +1,396 @@
+---
+title: "CATCHER on PIPseq — all QC plots"
+subtitle: "`catcheR_pipcatch` worked example"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    df_print: kable
+params:
+  analysis_dir:   "analysis_EB"
+  scratch:        "scratch"
+  output:         "Output"
+  to_scratch:     true
+  sample_name:    "AB019b"
+  fastq_r1:       "AB019b_BC_S4_L001_R1_001.fastq.gz"
+  fastq_r2:       "AB019b_BC_S4_L001_R2_001.fastq.gz"
+  barcodes_genes: ["rc_barcodes_genes_set1.csv", "rc_barcodes_genes_set2.csv"]
+  set_names:      ["set1", "set2"]
+  set_sizes:      [100, 60]
+  gex_prefix:     "AB019b_gex.scRNA.filtered"
+  percentage:     15
+  ratio:          2
+  umi_count:      0
+  jitter:         "auto"
+  max_reads:      ~
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.align = "center")
+library(catcheR)
+library(knitr)
+
+## Folder layout ------------------------------------------------------------
+##   analysis_EB/
+##     scratch/   <- all inputs (FASTQ, barcode CSVs, PIPseeker matrix)
+##     Output/    <- everything this document writes
+##
+## Paths are built from params so the same file runs on any sample: point
+## `analysis_dir` at the run folder and change `sample_name`.
+SCRATCH <- file.path(params$analysis_dir, params$scratch)
+OUT     <- file.path(params$analysis_dir, params$output)
+dir.create(OUT, showWarnings = FALSE, recursive = TRUE)
+
+## knitr writes figure paths relative to the .Rmd, so embedding files that live
+## in Output/ needs the relative path, not the absolute one.
+show <- function(f, ext = "jpg") {
+  p <- file.path(OUT, paste0(f, ".", ext))
+  if (file.exists(p)) knitr::include_graphics(p) else invisible(NULL)
+}
+MAXR <- if (is.null(params$max_reads)) Inf else as.numeric(params$max_reads)
+```
+
+# The pipeline, and where this document sits in it
+
+Four steps, in this order. Each one consumes what the previous produced, and
+nothing here re-reads the FASTQ after the first step.
+
+| # | step | reads | produces | needed by |
+|---|---|---|---|---|
+| 1 | `catcheR_pipcatch()` | the FASTQ pair and the barcode-to-gene CSVs | the `parsecatch` object (`.rds`), `complete_table_fin`, the 13 catcheR plots and the QC panels | every step below |
+| 2 | `catcheR_pip_filtercatch()` | the object from 1 | `ValidCell` at the chosen thresholds, `cells_with_at_least_1_UCI.csv`, `new_cell_names.csv` | steps 3 and 4 |
+| 3 | `catcheR_pip_nocatch()` | the object from 1 **and** the filter from 2 | the empty-vector cells, i.e. the unperturbed control set | step 4 (optional) |
+| 4 | `catcheR_pip_seurat()` | the filter from 2, the empty set from 3, and PIPseeker's `matrix.mtx.gz` / `features.tsv.gz` / `barcodes.tsv.gz` | the Seurat object with `catcheR_status` on every cell | your downstream analysis |
+
+**Why the order matters.** Step 3 needs step 2 because an "empty" cell is
+defined as one that is *not* in the called set: without the filter there is
+nothing to subtract from. Step 4 needs step 2 for the same reason and step 3
+only if you want the controls labelled rather than left as `not_detected`.
+
+**What can be repeated cheaply.** Steps 2 to 4 all act on the object, so
+re-filtering at new thresholds costs seconds and never re-streams the reads.
+Only step 1 is expensive.
+
+## Where the files go
+
+```
+analysis_EB_PIP/
+  scratch/                       <- inputs, plus the handoff copies below
+  Output/
+    pipcatch/                  <- step 1: this chemistry's own folder
+      filtercatch_p15_u0_r2/     <- step 2, tagged with its thresholds
+```
+
+Step 1 nests under the chemistry name so that running the 10x or Parse
+pipeline into the same `Output/` cannot overwrite these files - the 13 plots
+carrying catcheR's own names have no chemistry in the filename. Step 2 adds a
+folder named for its thresholds, so a second attempt at different values sits
+beside the first instead of replacing it.
+
+Three files are *inputs to a later step* rather than deliverables:
+`cells_with_at_least_1_UCI.csv`, `new_cell_names.csv` and
+`complete_table_fin_<sample>.csv`. With `to_scratch: true` they are copied into
+`scratch/` as `<name>_pipcatch_<sample>.csv`, so two pipelines can
+share one scratch without colliding. The originals stay in `Output/`.
+
+## One trap in the thresholds
+
+`UMI.count` and `percentage` exclude with a strict `>`, `min.cell.UMI` includes
+with `>=`. So `UMI.count = 1` keeps pairs of **two or more** UMIs, a UCI at
+exactly 15% does **not** pass `percentage = 15`, and a cell with exactly 20
+cassette UMIs **does** pass `min.cell.UMI = 20`. PIPseq has no deduplicable molecular index, so every count here is
+**reads**, not molecules: per-cell totals top out around ten and a floor tuned
+for a UMI-counted library would exclude every cell. That is why this document
+leaves `UMI.count = 0` and no floor.
+
+# Inputs
+
+Everything the run needs sits in `scratch/`. The chunk below is a guard: it
+fails loudly here rather than halfway through a 20 minute stream.
+
+```{r inputs}
+need <- c(params$fastq_r1, params$fastq_r2, params$barcodes_genes)
+inv  <- data.frame(
+  file   = need,
+  exists = file.exists(file.path(SCRATCH, need)),
+  size_MB = round(file.size(file.path(SCRATCH, need)) / 1024^2, 1)
+)
+stopifnot(all(inv$exists))
+kable(inv, caption = sprintf("Inputs found in %s", SCRATCH))
+```
+
+Two barcode-to-gene CSVs are passed because the two shRNA libraries were pooled
+before loading. `catcheR_pipcatch()` merges them, tags every construct with the
+set it came from, and resolves each file's orientation on its own — one of these
+two is reverse-complemented relative to the other, and the function reports which.
+
+# Extraction and first-stage QC
+
+One pass over the read pair. This is the only expensive step (roughly 7 minutes
+for an 18 M pair library), so the chunk is cached: re-knitting to adjust a plot
+or a threshold does not re-read the FASTQ.
+
+Set `max_reads` in the YAML header to a few million for a fast dry run; leave it
+empty (`~`) to use every read.
+
+```{r pipcatch, cache=TRUE}
+res <- catcheR_pipcatch(
+  folder         = SCRATCH,
+  fastq.read1    = params$fastq_r1,
+  fastq.read2    = params$fastq_r2,
+  barcodes.genes = params$barcodes_genes,
+  set.names      = params$set_names,
+  set.sizes      = as.integer(params$set_sizes),
+  # PIPseeker's own called-cell list. Supplying it is what unlocks the panels
+  # whose denominator is "cells the platform called" rather than "barcodes we
+  # happened to see" - the latter overstates coverage severalfold.
+  called.cells   = file.path(SCRATCH, paste0(params$gex_prefix, ".barcodes.tsv.gz")),
+  output_dir     = OUT,
+  sample_name    = params$sample_name,
+  percentage     = params$percentage,
+  ratio          = params$ratio,
+  UMI.count      = params$umi_count,
+  jitter         = params$jitter,
+  max.reads      = MAXR,
+  verbose        = FALSE
+)
+# The entry point nests its outputs one level down, under the chemistry name,
+# so another pipeline writing into the same Output/ cannot overwrite these.
+# Take the path from the object rather than rebuilding it here.
+OUT <- res$output_dir
+res
+```
+
+## What each read turned out to be
+
+The enrichment PCR is the bottleneck in this library, so it is worth reading
+this table before anything else: it says how much of the sequencing actually
+carried the cassette.
+
+```{r read-classes}
+kable(res$read_class, caption = "Read fates")
+```
+
+## Threshold suggestions
+
+`catcheR` offers two automatic estimators for the `UMIxUCI` cut. Both are
+reported; neither is applied unless you pass it to `UMI.count`.
+
+At this depth the deliberate choice is **`UMI.count = 0`** — the distribution is
+dominated by single-read (cell, UCI) pairs, so any positive threshold discards
+most of the data. More sequencing, not a cleverer threshold, is the fix.
+
+```{r thresholds}
+thr <- res$thresholds
+kable(data.frame(
+  quantity = c("(cell, UCI) pairs", "single-read pairs", "% single-read",
+               'mode = "noise" would pick', 'mode = "bimodal" would pick',
+               "applied (UMI.count)"),
+  value    = c(thr$pairs, thr$singletons, round(thr$pct_singletons, 1),
+               thr$noise, thr$bimodal, params$umi_count)
+), caption = "Threshold estimators (NA = the estimator found nothing to cut on)")
+```
+
+## The seven first-stage plots
+
+Written to `Output/` as both `.jpg` and `.pdf`, under the same file names
+`catcheR_10Xcatch` uses.
+
+```{r stage1-barcode, fig.cap="barcode_distribution — reads per construct, filled by gene"}
+show("barcode_distribution")
+```
+
+```{r stage1-gene, fig.cap="gene_distribution — reads per target gene"}
+show("gene_distribution")
+```
+
+```{r stage1-umixuci, fig.cap="UMIxUCI — reads per (cell, UCI) pair"}
+show("UMIxUCI")
+```
+
+The zoomed version of the same histogram clips the singleton peak so the tail is
+readable. Its file name carries the window that was used, and with `zoom.x` and
+`zoom.y` left at `NULL` that window is derived from the data.
+
+```{r stage1-zoom, fig.cap="UMIxUCI zoomed — singleton peak clipped"}
+zf <- list.files(OUT, pattern = "^UMIxUCI_[0-9]+_[0-9]+\\.jpg$")
+if (length(zf)) knitr::include_graphics(file.path(OUT, zf[1]))
+```
+
+```{r stage1-ucixcell, fig.cap="UCIxcell — distinct UCIs per cell barcode"}
+show("UCIxcell")
+```
+
+```{r stage1-pct, fig.cap="percentage_of_UMIxUCI_dist — share of a cell's reads held by each UCI"}
+show("percentage_of_UMIxUCI_dist")
+```
+
+```{r stage1-2d, fig.cap="2D_percentage_of_UMIxUCI_UMI_count — the plane the filter works in"}
+show("2D_percentage_of_UMIxUCI_UMI_count")
+```
+
+A note on that last panel. `catcheR` draws it with `geom_count()`, sizing each
+marker by how many pairs share a coordinate — the right geometry at 10X depth,
+where the axes are near-continuous. Here `UMIxUCI` takes a handful of integer
+values and the percentage only simple fractions, so thousands of pairs land on a
+few dozen coordinates and `geom_count()` collapses into three or four huge
+bubbles. With `jitter = "auto"` the function detects that and spreads the points
+instead. The data plotted is identical; force either geometry with
+`jitter = TRUE` / `jitter = FALSE`.
+
+```{r jitter-check}
+data.frame(
+  pairs       = nrow(res$tab),
+  coordinates = nrow(unique(res$tab[, c("UMIpercentagexUCI", "UMIxUCI")])),
+  jittered    = catcheR:::.cat_jitter_on(res$tab, params$jitter)
+)
+```
+
+# Cell filtering
+
+`catcheR_pip_filtercatch()` re-applies the thresholds without re-reading the
+FASTQ, writes `cells_with_at_least_1_UCI.csv` and `new_cell_names.csv`, and
+regenerates the six second-stage plots at the refined settings.
+
+```{r filtercatch}
+flt <- catcheR_pip_filtercatch(res,
+  # the files a later step reads are copied into scratch/, renamed with the
+  # chemistry and the sample, so several pipelines can share one scratch
+  to.scratch   = if (isTRUE(params$to_scratch)) SCRATCH else NULL,
+                               UMI.count  = params$umi_count,
+                               percentage = params$percentage,
+                               ratio      = params$ratio,
+                               output_dir = OUT,
+                               jitter     = params$jitter,
+                               verbose    = FALSE)
+kable(flt$filter_returns, caption = "ValidCell count across candidate thresholds")
+```
+
+```{r stage2-thr, fig.cap="2D_percentage_of_UMIxUCI_UMI_count_thresholds"}
+show("2D_percentage_of_UMIxUCI_UMI_count_thresholds")
+```
+
+```{r stage2-true, fig.cap="true_UCIxcell — cells by number of UCIs passing the filter"}
+show("true_UCIxcell")
+```
+
+```{r stage2-truefalse, fig.cap="2D_percentage_of_UMIxUCI_UMI_count_trueorfalse"}
+show("2D_percentage_of_UMIxUCI_UMI_count_trueorfalse")
+```
+
+```{r stage2-clones, fig.cap="cellsxclone — cells per clone (UCI)"}
+show("cellsxclone")
+```
+
+```{r stage2-clones-log, fig.cap="cellsxclone_log10"}
+show("cellsxclone_log10")
+```
+
+```{r stage2-valid, fig.cap="2D_percentage_of_UMIxUCI_UMI_count_ValidCells"}
+show("2D_percentage_of_UMIxUCI_UMI_count_ValidCells")
+```
+
+# Unperturbed cells
+
+Cells carrying the empty vector. Read the printed note: at low depth the
+absence of a cassette read is far more often a sampling failure than a real
+empty cell, and the function says so rather than handing back a control set it
+cannot support.
+
+```{r nocatch}
+noc <- catcheR_pip_nocatch(res, filtered = flt, threshold = 0,
+                           output_dir = OUT, verbose = TRUE)
+```
+
+# PIPseq-specific panels
+
+These six have no `catcheR_10Xcatch` equivalent — they exist because the
+PIPseq cell barcode has to be parsed out of read 1 rather than sliced at a fixed
+offset, which makes the per-cell denominators and the no-call fates worth
+showing explicitly.
+
+```{r pip-detect, fig.cap="Cell detection: how many barcodes survive each step"}
+show("pipcatch_cell_detection", "png")
+```
+
+```{r pip-nocall, fig.cap="What the cells without a call actually contain"}
+show("pipcatch_nocall_fates", "png")
+```
+
+```{r pip-clone, fig.cap="Constructs detected and clones per construct"}
+show("pipcatch_shRNA_clone_matrix", "png")
+```
+
+```{r pip-dist, fig.cap="Barcode and gene distributions, both libraries"}
+show("pipcatch_QC_distributions", "png")
+```
+
+```{r pip-thr, fig.cap="Threshold diagnostics as produced by the extraction step"}
+show("pipcatch_QC_thresholds", "png")
+```
+
+```{r pip-fthr, fig.cap="The same diagnostics recomputed at the refined thresholds"}
+show("pipcatch_filtercatch_thresholds", "png")
+```
+
+## Judged against the cells PIPseeker actually called
+
+Everything above counts every barcode the enrichment library produced, ambient
+included. The honest denominator is PIPseeker's own cell list.
+
+```{r called-comp, fig.cap="Clone composition of the called cells"}
+show("pipcatch_called_composition", "png")
+```
+
+```{r called-floor, fig.cap="The read-floor panel restricted to called cells"}
+show("pipcatch_UCI_per_cell_called", "png")
+```
+
+```{r called-yield, fig.cap="Yield against expected wrong calls"}
+show("pipcatch_yield_vs_error", "png")
+```
+
+# Join to the expression matrix
+
+Optional, and skipped automatically when the PIPseeker files are not in
+`scratch/`. PIPseeker writes `barcodes.tsv.gz` as the same 28 nt concatenated
+four-tier barcode that `pipcatch` extracts, so the join is a plain string match
+— the function warns if it ever sees a different width.
+
+Note the cell counts here, not the ones above: dividing by *called* cells is the
+honest denominator, and a fraction of the calls fall on ambient barcodes that
+PIPseeker never called as cells.
+
+```{r seurat}
+gex <- file.path(SCRATCH, paste0(params$gex_prefix,
+                                 c(".matrix.mtx.gz", ".features.tsv.gz", ".barcodes.tsv.gz")))
+if (all(file.exists(gex))) {
+  obj <- catcheR_pip_seurat(res, filtered = flt, empty = noc,
+                            mtx = gex[1], features = gex[2], cells = gex[3],
+                            sample_id = params$sample_name,
+                            project   = params$sample_name,
+                            rename = TRUE, subset.valid = TRUE,
+                            output_dir = OUT, verbose = TRUE)
+} else {
+  message("PIPseeker matrix not found in scratch/ - skipping the join.")
+}
+```
+
+When you scale this to several samples, attach the metadata to each object
+*before* `merge(..., add.cell.ids = ...)`. The merge prefixes every barcode with
+the sample id, after which the 28 nt key no longer matches.
+
+# Files written
+
+```{r manifest}
+f <- list.files(OUT)
+kable(data.frame(file = f,
+                 size_KB = round(file.size(file.path(OUT, f)) / 1024, 1)),
+      caption = sprintf("Contents of %s", OUT))
+```
+
+```{r session}
+sessionInfo()
+```

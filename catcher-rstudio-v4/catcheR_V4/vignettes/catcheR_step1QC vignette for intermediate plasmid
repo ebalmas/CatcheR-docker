@@ -1,0 +1,103 @@
+
+---
+title: "catcheR step1QC workflow"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{catcheR step1QC workflow}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+catcheR_step1QC() performs the first plasmid QC step before single-cell catching.
+At this step, the heterogeneity of plasmid clones should be high
+The function allows to identify whether some plasmids have barcode swaps or mutation events
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(collapse = TRUE, comment = "#>", eval = FALSE)
+```
+
+# Purpose
+
+`catcheR_step1QC()` performs the first QC step on plasmid/intermediate cloning sequencing data. It is useful before the final plasmid-library QC because it helps identify reliable clones and potential barcode-swap information.
+
+# Required input files
+
+The input `folder` should contain at least:
+
+```text
+scratch/step1/
+  rc_barcodes_genes.csv
+  expected_shRNA_names.csv
+  plasmid_intermediate_R1.fastq.gz
+```
+
+Optionally, you can also provide a clone list file, for example:
+
+```text
+clones_of_interest.txt
+```
+
+# Run step1QC
+
+```{r run-step1qc}
+library(catcheR)
+
+step1 <- catcheR_step1QC(
+  folder         = "scratch/step1/",
+  fastq.read1    = "plasmid_intermediate_R1.fastq.gz",
+  output_dir     = "Output/",
+  sample_name    = "CATCHER1",
+  DIs            = 100,
+  ratio          = 10,
+  plot.threshold = 2000,
+  clones         = NULL
+)
+```
+
+# Arguments
+
+- `folder`: directory containing the input files.
+- `fastq.read1`: FASTQ R1 file name inside `folder`.
+- `output_dir`: root output directory.
+- `sample_name`: label used in the dated run folder.
+- `DIs`: read-count threshold used to define reliable clones.
+- `ratio`: ratio threshold used by the barcode-swap detection logic.
+- `plot.threshold`: upper plotting threshold used by the original step1QC plotting logic.
+- `clones`: optional clone list file name inside `folder`.
+
+# Output folders
+
+```text
+Output/step1QC/YYMMDD_step1QC_CATCHER1/
+  csv/
+  plots/
+  stats/
+  R_objects/
+  to_scratch/
+```
+
+The most important checkpoint file is copied to `to_scratch/`:
+
+```text
+reliable_clones_swaps_*.csv
+```
+
+This file can be used later by `catcheR_sortcatch()`.
+
+# Work with the returned object in R
+
+```{r inspect-step1qc}
+names(step1)
+step1$paths
+step1$files
+
+# Reload later
+step1 <- readRDS("Output/step1QC/YYMMDD_step1QC_CATCHER1/R_objects/step1QC_result.rds")
+```
+
+# Restart from checkpoint
+
+```bash
+cp Output/step1QC/YYMMDD_step1QC_CATCHER1/to_scratch/* scratch/10X/
+```
+
+Then use the copied swap file in `catcheR_sortcatch()`.

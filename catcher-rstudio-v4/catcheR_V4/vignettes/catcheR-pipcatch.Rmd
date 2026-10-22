@@ -1,0 +1,143 @@
+---
+title: "catcheR_pipcatch: CATCHER barcode assignment for Fluent PIPseq"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{catcheR_pipcatch: CATCHER barcode assignment for Fluent PIPseq}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r, include = FALSE}
+knitr::opts_chunk$set(collapse = TRUE, comment = "#>", eval = FALSE)
+```
+
+## Why a separate entry point
+
+`catcheR_10Xcatch()` slices read 1 at fixed offsets: `cut -c 1-16` for the cell
+ID and `cut -c 17-28` for the UMI. PIPseq breaks that assumption. Read 1 carries
+0–3 phasing bases followed by a four-tier barcode separated by constant linkers:
+
+```
+[0-3 nt phasing] bc1(8) ATG bc2(6) GAG bc3(6) TCGAG bc4(8) [index 3] ACG (dT)n
+```
+
+The fields therefore move from read to read and must be matched, not sliced.
+Read 2 is unchanged from the 10X design: the construct is read from the
+enrichment primer, so `revcomp(reference)` sits at positions 1–23, followed by
+`revcomp(UCI)` and `revcomp(barcode)`.
+
+Two further consequences:
+
+* **There is no usable UMI.** The 3 nt molecular index has only 64 values and
+  collides constantly, so every metric counts **reads**. The column keeps the
+  name `UMIxUCI` for continuity with `catcheR_filtercatch()`.
+* **Matching the linkers is not enough.** Requiring only `ATG`/`GAG`/`TCGAG`
+  admits roughly fifteen times more reads than requiring the whole oligo, almost
+  all of them chance matches in construct or adapter sequence. `.pip_parse_r1()`
+  also requires the index, the constant `ACG` and the oligo-dT.
+
+## Extraction
+
+```{r}
+library(catcheR)
+
+res <- catcheR_pipcatch(
+  folder         = "data",
+  fastq.read1    = "AB019b_BC_S4_L001_R1_001.fastq.gz",
+  fastq.read2    = "AB019b_BC_S4_L001_R2_001.fastq.gz",
+  barcodes.genes = c("rc_barcodes_genes_set1.csv", "rc_barcodes_genes_set2.csv"),
+  set.names      = c("set1", "set2"),
+  set.sizes      = c(100L, 60L),
+  output_dir     = "Output/pipcatch",
+  sample_name    = "AB019b"
+)
+res
+```
+
+Pooled experiments are often supplied as several barcode CSVs written in
+opposite orientations. `catcheR_pipcatch()` resolves each file against the
+barcodes actually observed in the reads and reports what it did, rather than
+trusting the file:
+
+```
+set1: 100 barcodes, as given (fwd 52 / rc 0)
+set2: 60 barcodes, reverse-complemented (fwd 0 / rc 40)
+```
+
+## Thresholds
+
+Both of catcheR's automatic estimators assume more depth than a PIPseq
+enrichment library usually has, so `catcheR_pipcatch()` reports what they
+*would* choose instead of silently applying one.
+
+`mode = "noise"` is undefined once more than `1 / 1.35 = 74.07 %` of
+(cell, UCI) pairs are singletons: the term `1 - perc_1/100 * 1.35` goes
+negative and the original subsets with a negative index. `mode = "bimodal"`
+needs a genuine valley in the `UMIxUCI` histogram; at low depth the only local
+minimum is a gap in the tail, and taking it discards almost every cell.
+
+```{r}
+flt <- catcheR_pip_filtercatch(res, UMI.count = 0, percentage = 15, ratio = 2)
+flt$filter_returns
+```
+
+The threshold is a **read count per (cell, UCI) pair**, compared with a strict
+`>`. `UMI.count = 1` therefore means "at least 2 reads" and discards every
+single-read UCI. Note also that `ratio` is inert at `UMI.count = 0`: every
+surviving cell sits at `UMIpercentagexUCI == 100` and takes the escape clause in
+the `ValidCell` rule. It only matters once the threshold is raised.
+
+## Empty cells
+
+`catcheR_pip_nocatch()` selects reads carrying the no-insertion reference. That
+sequence is an argument rather than a string inside a shell script, because the
+junction is construct-specific: when the cassette is absent the vector flanks
+fuse and regenerate `TACGCGTTCATCTGGGGGAGCCG`, which also places the downstream
+constant 21 nt earlier in read 2 than in a cassette-bearing read.
+
+```{r}
+noc <- catcheR_pip_nocatch(res, filtered = flt, threshold = 0)
+```
+
+## Joining to the expression matrix
+
+PIPseeker writes `barcodes.tsv.gz` as the same 28 nt concatenated four-tier
+barcode that `catcheR_pipcatch()` extracts, so the join is a direct match and no
+whitelist translation is needed. Confirm once per chemistry with
+`nchar(readLines(gzfile(cells)))[1]`.
+
+```{r}
+obj <- catcheR_pip_seurat(
+  res, filtered = flt, empty = noc,
+  mtx      = "AB019b_gex.scRNA.filtered.matrix.mtx.gz",
+  features = "AB019b_gex.scRNA.filtered.features.tsv.gz",
+  cells    = "AB019b_gex.scRNA.filtered.barcodes.tsv.gz",
+  protein.coding = protein_coding_genes,
+  sample_id = "AB019b", rename = TRUE, subset.valid = TRUE
+)
+```
+
+Every cell gains `shRNA`, `gene`, `set`, `UCI`, `barcode`, `UMIxUCI`,
+`reads_total`, `n_UCI`, `ValidCell`, `is_empty` and `catcheR_status`. With
+`rename = TRUE` the cells are renamed to catcheR's
+`cellID_UMIxUCI_barcode_gene_UCI`.
+
+When you merge several samples, attach the metadata **before** the merge:
+`Seurat::merge(add.cell.ids = ...)` prefixes the barcodes, after which the 28 nt
+key no longer matches.
+
+## Report
+
+```{r}
+catcheR_pip_report(
+  folder = "data",
+  fastq.read1 = "AB019b_BC_S4_L001_R1_001.fastq.gz",
+  fastq.read2 = "AB019b_BC_S4_L001_R2_001.fastq.gz",
+  ref_csv = c("rc_barcodes_genes_set1.csv", "rc_barcodes_genes_set2.csv"),
+  set_names = c("set1", "set2"), set_sizes = c(100L, 60L),
+  outdir = "pipcatch_out"
+)
+```
+
+This re-runs the extraction and knits the step-by-step document bundled at
+`system.file("rmd", "catcheR_pipcatch_report.Rmd", package = "catcheR")`.

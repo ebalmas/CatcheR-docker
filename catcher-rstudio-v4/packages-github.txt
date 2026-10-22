@@ -1,0 +1,3 @@
+scMAGeCK	weili-lab/scMAGeCK	e24aa0f3c9734c26ffbc200107adf0e199b26208
+SeuratWrappers	satijalab/seurat-wrappers	8728711e325f6561f4bde164e37953eb8f100e58
+catcheR	ebalmas/catcheR	724ef8900a6edb31136a7b0ccf4d3d5e3ba18dbe

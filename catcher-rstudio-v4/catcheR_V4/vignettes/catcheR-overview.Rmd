@@ -1,0 +1,182 @@
+---
+title: "catcheR overview: complete native pipeline"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{catcheR overview: complete native pipeline}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>",
+  eval = FALSE
+)
+```
+
+# Overview
+
+`catcheR` is an R package for CATCHER / iPS2-seq workflows. It contains functions for plasmid-library quality control, single-cell barcode catching, caught-cell filtering, no-catch/empty-cell handling, and barcode-swap correction.
+
+This vignette is a map of the full workflow. The detailed usage for each module is described in the dedicated vignettes:
+
+- `vignette("catcheR-step1QC")`
+- `vignette("catcheR-step2QC")`
+- `vignette("catcheR-10Xcatch")`
+- `vignette("catcheR-filter-nocatch")`
+- `vignette("catcheR-sortcatch")`
+
+# Recommended project layout
+
+A useful layout is to keep raw/intermediate files in `scratch/` and to write all package outputs to dated folders inside `Output/`.
+
+```text
+project/
+  scratch/
+    CATCHER1/
+    CATCHER2/
+    10X/
+  Output/
+    step1QC/
+    step2QC_extraction/
+    step2QC_plasmidQC/
+    step2QC_combinedQC/
+    10Xcatch/
+    10XcatchQC/
+    filtercatch/
+    nocatch/
+    sortcatch/
+```
+
+Each catcheR function writes a dated run folder:
+
+```text
+Output/<function>/YYMMDD_<function>_<sample>/
+  csv/
+  plots/
+  stats/
+  R_objects/
+  to_scratch/
+```
+
+The `to_scratch/` folder contains only the files needed by the next step. You can copy them into `scratch/` if you want to restart later without rerunning previous steps.
+
+# Full workflow skeleton
+
+```{r full-workflow}
+library(catcheR)
+
+# Step 1: initial plasmid/intermediate QC
+step1 <- catcheR_step1QC(
+  folder      = "scratch/step1/",
+  fastq.read1 = "plasmid_intermediate_R1.fastq.gz",
+  output_dir  = "Output/",
+  sample_name = "CATCHER1",
+  DIs         = 100,
+  ratio       = 10
+)
+
+# Step 2A: extract barcode/UCI/read-count information from final plasmid FASTQ
+extract <- catcheR_step2QC_extraction(
+  fastq      = "scratch/CATCHER1/final_plasmid_R1.fastq.gz",
+  barcodes   = "scratch/CATCHER1/rc_barcodes_genes.csv",
+  output_dir = "scratch/CATCHER1/results/",
+  DIs        = 300
+)
+
+# Step 2B: single-library plasmid QC
+qc1 <- catcheR_step2QC_plasmidQC(
+  results_dir      = "scratch/CATCHER1/results/",
+  output_dir       = "Output/",
+  sample_name      = "CATCHER1",
+  DIs              = 300,
+  transfect_clones = 100,
+  transfect_cells  = 2e6,
+  nucleofect_cells = 2e6
+)
+
+# Optional: compare two independently generated libraries
+combined <- catcheR_step2QC_combinedQC(
+  lib1_dir         = "scratch/CATCHER1/results/",
+  lib2_dir         = "scratch/CATCHER2/results/",
+  output_dir       = "Output/",
+  sample_name      = "CATCHER1_CATCHER2",
+  lib1_name        = "CATCHER1",
+  lib2_name        = "CATCHER2",
+  DIs              = 300,
+  transfect_clones = 100,
+  transfect_cells  = 2e6,
+  nucleofect_cells = 2e6
+)
+
+# Step 3: catch shRNA/barcode information in 10X reads
+catch <- catcheR_10Xcatch(
+  folder            = "scratch/10X/",
+  fastq.read1       = "sample_R1.fastq.gz",
+  fastq.read2       = "sample_R2.fastq.gz",
+  expression.matrix = "filtered_feature_bc_matrix.h5",
+  samples           = 1,
+  mode              = "bimodal"
+)
+
+# Step 4: inspect 10X catching QC and derive UMI threshold
+catch_qc <- catcheR_10XcatchQC(
+  folder      = "scratch/10X/",
+  output_dir  = "Output/",
+  sample_name = "AB017",
+  samples     = 1,
+  mode        = "bimodal"
+)
+
+# Step 5: filter caught cells
+filtered <- catcheR_filtercatch(
+  folder            = "scratch/10X/",
+  expression.matrix = "filtered_feature_bc_matrix.h5",
+  output_dir        = "Output/",
+  sample_name       = "AB017",
+  samples           = 1
+)
+
+# Step 6: identify no-catch/empty cells if required
+nocatch <- catcheR_nocatch(
+  folder            = "scratch/10X/",
+  expression.matrix = "filtered_feature_bc_matrix.h5",
+  output_dir        = "Output/",
+  sample_name       = "AB017",
+  samples           = 1
+)
+
+# Step 7: correct barcode swaps
+sorted <- catcheR_sortcatch(
+  folder      = "scratch/10X/",
+  matrix      = "silencing_matrix_complete_1.rds",
+  swaps       = "reliable_clones_swaps_DIs100_ratio10.csv",
+  output_dir  = "Output/",
+  sample_name = "AB017"
+)
+```
+
+# Returned objects
+
+Every high-level function returns a named list and also saves the same information to `R_objects/`.
+
+```{r returned-objects}
+names(qc1)
+qc1$paths
+qc1$plots
+qc1$summary
+
+# Reload a completed run later
+qc1_reloaded <- readRDS("Output/step2QC_plasmidQC/YYMMDD_step2QC_plasmidQC_CATCHER1/R_objects/step2QC_plasmidQC_result.rds")
+```
+
+# Checkpoint and restart
+
+To restart from a completed step, copy the contents of that run's `to_scratch/` folder into your scratch area:
+
+```bash
+cp Output/step2QC_plasmidQC/YYMMDD_step2QC_plasmidQC_CATCHER1/to_scratch/* scratch/CATCHER1/
+```
+
+Then use the scratch folder as input to the next function.
